@@ -414,7 +414,7 @@ static int curl_transport_perform(void *ctx,
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(easy, CURLOPT_MAXREDIRS, 3L);
     curl_easy_setopt(easy, CURLOPT_USERAGENT,
-                     "PSPSky/1.0.0 (PlayStation Portable; ARK-4)");
+                     "PSPSky/1.0.1 (PlayStation Portable; ARK-4)");
     curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, (void *)&buf);
