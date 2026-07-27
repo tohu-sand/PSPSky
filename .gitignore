@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.elf
+*.prx
+EBOOT.PBP
+PARAM.SFO
+build/
+
+# Host-side test harness (not part of the public distribution)
+tests/
+Makefile.host
+
+# Runtime configuration (contains credentials in plaintext)
+pspsky.cfg
+
+# Windows / WSL metadata
+*:Zone.Identifier
+docs/INSTALL.md
+assets/*.svg
