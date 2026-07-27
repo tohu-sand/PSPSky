@@ -30,6 +30,13 @@
 #define POST_COLLECTION    "app.bsky.feed.post"
 #define EMBED_IMAGES_TYPE  "app.bsky.embed.images"
 
+/* View-side ($type) counterparts, as returned by getTimeline */
+#define EMBED_IMAGES_VIEW  "app.bsky.embed.images#view"
+#define EMBED_RWM_VIEW     "app.bsky.embed.recordWithMedia#view"
+
+/* 802.11b at ~200KB/s needs headroom for a ~50KB thumbnail */
+#define ATP_IMAGE_TIMEOUT_SEC 15
+
 /* "via" is not in the app.bsky.feed.post lexicon, but records tolerate extra
    top-level fields and clients render it by convention as "via PSPSky". */
 #define PSPSKY_VIA_NAME    "PSPSky"
@@ -182,6 +189,17 @@ static const cJSON *json_obj(const cJSON *obj, const char *key)
         return NULL;
     }
     return it;
+}
+
+/* 0 unless obj[key] is a positive number */
+static int json_pos_int(const cJSON *obj, const char *key)
+{
+    const cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+
+    if (!cJSON_IsNumber(it) || it->valueint <= 0) {
+        return 0;
+    }
+    return it->valueint;
 }
 
 /* ------------------------------------------------------------------ */
@@ -474,6 +492,81 @@ cleanup:
     return rc;
 }
 
+/* Returns the images array of an embed view, or NULL when there is none.
+   Only thumb/aspectRatio are ever looked at; sibling engagement fields are
+   not read, copied or logged. */
+static const cJSON *embed_view_images(const cJSON *post)
+{
+    const cJSON *embed = json_obj(post, "embed");
+    const cJSON *images = NULL;
+    const char  *type;
+
+    if (embed == NULL) {
+        return NULL;
+    }
+    type = json_str(embed, "$type");
+    if (type == NULL) {
+        return NULL;
+    }
+
+    if (strcmp(type, EMBED_IMAGES_VIEW) == 0) {
+        images = cJSON_GetObjectItemCaseSensitive(embed, "images");
+    } else if (strcmp(type, EMBED_RWM_VIEW) == 0) {
+        const cJSON *media = json_obj(embed, "media");
+        const char  *mtype = (media != NULL) ? json_str(media, "$type") : NULL;
+
+        if (mtype != NULL && strcmp(mtype, EMBED_IMAGES_VIEW) == 0) {
+            images = cJSON_GetObjectItemCaseSensitive(media, "images");
+        }
+    }
+
+    return cJSON_IsArray(images) ? images : NULL;
+}
+
+/* Fills img_count plus the first thumb URL and its aspect ratio */
+static void post_read_images(const cJSON *post, pspsky_post_t *p)
+{
+    const cJSON *images = embed_view_images(post);
+    const cJSON *first;
+    const cJSON *ratio;
+    const char  *thumb;
+    int          n;
+    int          w;
+    int          h;
+
+    if (images == NULL) {
+        return;
+    }
+    n = cJSON_GetArraySize(images);
+    if (n <= 0) {
+        return;
+    }
+    p->img_count = n;
+
+    first = cJSON_GetArrayItem(images, 0);
+    if (first == NULL) {
+        return;
+    }
+
+    /* A URL that does not fit leaves thumb_url empty, which degrades to the
+       marker while img_count still reflects the post. */
+    thumb = json_str(first, "thumb");
+    if (thumb != NULL && thumb[0] != '\0') {
+        (void)copy_exact(p->thumb_url, sizeof(p->thumb_url), thumb);
+    }
+
+    ratio = json_obj(first, "aspectRatio");
+    if (ratio == NULL) {
+        return;
+    }
+    w = json_pos_int(ratio, "width");
+    h = json_pos_int(ratio, "height");
+    if (w > 0 && h > 0) {
+        p->img_aspect_w = w;
+        p->img_aspect_h = h;
+    }
+}
+
 /* E_PARSE when handle or text is missing; the caller skips that element */
 static int post_from_feed_item(const cJSON *item, pspsky_post_t *p)
 {
@@ -513,6 +606,9 @@ static int post_from_feed_item(const cJSON *item, pspsky_post_t *p)
        nothing below this key is ever read */
     p->has_embed =
         (cJSON_GetObjectItemCaseSensitive(record, "embed") != NULL) ? 1 : 0;
+
+    /* The hydrated view sits next to record and carries the thumb URLs */
+    post_read_images(post, p);
 
     copy_utf8_trunc(p->handle,       sizeof(p->handle),       handle);
     copy_utf8_trunc(p->display_name, sizeof(p->display_name), display);
@@ -954,6 +1050,65 @@ int pspsky_atp_create_post_ex(const pspsky_transport_t *t,
     int status = 0;
     return atp_create_post_impl(t, sess, text_utf8, created_at_iso, image,
                                 errmsg, &status);
+}
+
+/* No auth and no refresh retry: the CDN is public, so a retry buys nothing. */
+int pspsky_atp_fetch_image(const pspsky_transport_t *t,
+                           const char *url,
+                           unsigned char **out, size_t *out_len,
+                           char *errmsg)
+{
+    pspsky_http_req_t  req;
+    pspsky_http_resp_t resp;
+    char terr[PSPSKY_HTTP_ERRMSG_MAX + 1];
+    int  rc;
+
+    if (errmsg != NULL) {
+        errmsg[0] = '\0';
+    }
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+    if (t == NULL || t->perform == NULL || url == NULL || url[0] == '\0' ||
+        out == NULL || out_len == NULL) {
+        return PSPSKY_E_ARG;
+    }
+
+    /* Must be zeroed in full before any field is set */
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+    req.method      = "GET";
+    req.url         = url;
+    req.timeout_sec = ATP_IMAGE_TIMEOUT_SEC;
+
+    rc = t->perform(t->ctx, &req, &resp);
+
+    /* The transport errmsg is not guaranteed NUL-terminated */
+    memcpy(terr, resp.errmsg, sizeof(resp.errmsg));
+    terr[PSPSKY_HTTP_ERRMSG_MAX] = '\0';
+
+    if (rc != PSPSKY_OK) {
+        set_errmsg(errmsg, terr[0] != '\0' ? terr : NULL);
+        free(resp.body);
+        return rc;
+    }
+
+    if (resp.status != 200) {
+        char fallback[32];
+
+        snprintf(fallback, sizeof(fallback), "HTTP %d", resp.status);
+        set_errmsg(errmsg, fallback);
+        free(resp.body);
+        return PSPSKY_E_HTTP;
+    }
+
+    /* Ownership of the body moves to the caller; it may contain NUL bytes */
+    *out     = (unsigned char *)resp.body;
+    *out_len = resp.body_len;
+    return PSPSKY_OK;
 }
 
 int pspsky_atp_upload_blob(const pspsky_transport_t *t,

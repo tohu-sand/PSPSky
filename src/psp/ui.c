@@ -49,6 +49,7 @@
 #define UI_TIME_LINE_H  13                          /* timestamp line height */
 #define UI_TIME_BASELINE 10                         /* timestamp top to baseline */
 #define UI_POST_PAD     6                           /* bottom padding + separator */
+#define UI_TL_IMG_GAP   4                           /* body to thumbnail gap */
 #define UI_SCROLL_STEP  8                           /* scroll amount per frame */
 #define UI_ANALOG_DEAD  48
 
@@ -91,6 +92,11 @@
 #define UI_PICK_REPEAT_DELAY 20   /* frames held before repeat starts */
 #define UI_PICK_REPEAT_RATE  4    /* frames between repeats */
 
+/* Timeline thumbnail textures: 4 slots of 256x128 (power of two), 512KB */
+#define UI_TL_TEX_SLOTS   4
+#define UI_TL_TEX_W       256
+#define UI_TL_TEX_H       128
+
 /* Image preview screen */
 #define UI_PREV_MAX_DIM   512     /* max texture side (power of two)    */
 #define UI_PREV_MIN_DIM   16      /* min texture side (power of two)    */
@@ -111,6 +117,7 @@
 #define UI_PREV_FOOTER_TEXT pspsky_tr(PSPSKY_STR_UI_FOOTER_PREV)
 #define UI_PREV_NO_IMAGE    pspsky_tr(PSPSKY_STR_UI_PREV_NO_IMAGE)
 #define UI_PREV_NO_IMAGE_SUB pspsky_tr(PSPSKY_STR_UI_PREV_NO_IMAGE_SUB)
+#define UI_IMG_MARK_N_FMT   pspsky_tr(PSPSKY_STR_UI_IMG_MARK_N)
 
 /* ------------------------------------------------------------------ */
 /* Internal state                                                      */
@@ -178,6 +185,15 @@ static char            s_pick_path[PSPSKY_UI_PICK_PATH_MAX]; /* build scratch */
 /* Preview texture, 512x512 GU_PSM_8888 = 1MB; valid region is the top-left. */
 static unsigned int __attribute__((aligned(64)))
     s_prev_tex[UI_PREV_MAX_DIM * UI_PREV_MAX_DIM];
+
+/* Timeline thumbnail textures, 512KB, filled on a slot miss only. s_tl_tex_post
+   maps a slot to the post index it holds (-1 = empty); those indices and the
+   rgb buffers behind them belong to main, so every slot is dropped by
+   pspsky_ui_timeline_invalidate() before main is free to release them. */
+static unsigned int __attribute__((aligned(16)))
+    s_tl_tex[UI_TL_TEX_SLOTS][UI_TL_TEX_W * UI_TL_TEX_H];
+static int s_tl_tex_post[UI_TL_TEX_SLOTS] = { -1, -1, -1, -1 };
+static int s_tl_tex_next = 0;   /* round robin */
 
 typedef struct {
     unsigned int color;
@@ -463,13 +479,148 @@ static const char *ui_fit_head_apply(const char *src, const ui_fit_cache_t *fc,
 }
 
 /* ------------------------------------------------------------------ */
+/* Timeline thumbnails                                                 */
+/* ------------------------------------------------------------------ */
+
+/* The thumbnail of post idx, or NULL when it can only be marked as text.
+   Sizes are checked here because a slot holds UI_TL_TEX_W x UI_TL_TEX_H at
+   most, and both the layout and the draw path branch on this result. */
+static const pspsky_ui_tl_image_t *ui_tl_image(const pspsky_ui_timeline_view_t *view,
+                                               int idx)
+{
+    const pspsky_ui_tl_image_t *img;
+
+    if (view->images == NULL) {
+        return NULL;
+    }
+    img = &view->images[idx];
+    if (img->rgb == NULL ||
+        img->w < 1 || img->w > PSPSKY_UI_TL_IMG_MAX_W ||
+        img->h < 1 || img->h > PSPSKY_UI_TL_IMG_MAX_H) {
+        return NULL;
+    }
+    return img;
+}
+
+/* Height taken under the body by the thumbnail or the marker line. Shared so
+   that ui_layout_post() and ui_draw_post() cannot drift apart. */
+static int ui_post_extra_h(const pspsky_post_t *post,
+                           const pspsky_ui_tl_image_t *img)
+{
+    if (img != NULL) {
+        int h = UI_TL_IMG_GAP + img->h;
+
+        if (post->img_count >= 2) {
+            h += UI_LINE_H;   /* the "[images xN]" line under the thumbnail */
+        }
+        return h;
+    }
+    if (post->img_count >= 1) {
+        return UI_LINE_H;     /* marker line instead of the thumbnail */
+    }
+    if (post->has_embed) {
+        return UI_LINE_H;     /* embed of some other kind */
+    }
+    return 0;
+}
+
+/* Marker text for a post with img_count >= 1 and no usable thumbnail. */
+static const char *ui_img_mark(const pspsky_post_t *post, char *buf, size_t cap)
+{
+    if (post->img_count < 2) {
+        return UI_EMBED_MARK;
+    }
+    snprintf(buf, cap, UI_IMG_MARK_N_FMT, post->img_count);
+    return buf;
+}
+
+/* Returns the slot holding post idx, uploading it on a miss. */
+static const unsigned int *ui_tl_tex_bind(int idx, const pspsky_ui_tl_image_t *img)
+{
+    unsigned int *tex;
+    int           slot, x, y;
+
+    for (slot = 0; slot < UI_TL_TEX_SLOTS; slot++) {
+        if (s_tl_tex_post[slot] == idx) {
+            return s_tl_tex[slot];
+        }
+    }
+    slot          = s_tl_tex_next;
+    s_tl_tex_next = (s_tl_tex_next + 1) % UI_TL_TEX_SLOTS;
+    tex           = s_tl_tex[slot];
+
+    for (y = 0; y < img->h; y++) {
+        const unsigned char *src = img->rgb + (size_t)y * (size_t)img->w * 3u;
+        unsigned int        *dst = tex + (size_t)y * (size_t)UI_TL_TEX_W;
+
+        for (x = 0; x < img->w; x++) {
+            dst[x] = 0xFF000000u |
+                     ((unsigned int)src[x * 3 + 2] << 16) |
+                     ((unsigned int)src[x * 3 + 1] << 8) |
+                     (unsigned int)src[x * 3 + 0];
+        }
+    }
+    sceKernelDcacheWritebackRange(tex,
+                                  (unsigned int)UI_TL_TEX_W * 4u *
+                                  (unsigned int)img->h);
+    s_tl_tex_post[slot] = idx;
+    return tex;
+}
+
+/* Draws the thumbnail at 1:1; the list scissor clips it. */
+static void ui_tl_draw_image(int idx, const pspsky_ui_tl_image_t *img,
+                             int x, int y)
+{
+    const unsigned int *tex;
+    ui_tex_vertex_f_t  *v;
+
+    tex = ui_tl_tex_bind(idx, img);
+    v   = (ui_tex_vertex_f_t *)sceGuGetMemory(2 * sizeof(ui_tex_vertex_f_t));
+    if (!v) {
+        return;
+    }
+    v[0].u = 0.0f;
+    v[0].v = 0.0f;
+    v[0].x = (float)x;
+    v[0].y = (float)y;
+    v[0].z = 0.0f;
+    v[1].u = (float)img->w;
+    v[1].v = (float)img->h;
+    v[1].x = (float)(x + img->w);
+    v[1].y = (float)(y + img->h);
+    v[1].z = 0.0f;
+
+    /* intraFontPrint returns with GU_DEPTH_TEST enabled. */
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, UI_TL_TEX_W, UI_TL_TEX_H, UI_TL_TEX_W, tex);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);   /* 1:1, so no filtering needed */
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    /* GU_TCC_RGB takes alpha from the vertex colour; these carry none. */
+    sceGuColor(0xFFFFFFFF);
+    /* Must be float (32BITF), as in ui_prev_draw_image(). */
+    sceGuDrawArray(GU_SPRITES,
+                   GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
+                   2, 0, v);
+
+    /* intraFontPrint skips rebinding its texture while INTRAFONT_ACTIVE, so
+       later text would sample the thumbnail bound above. */
+    if (s_font) {
+        intraFontActivate(s_font);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Timeline layout                                                     */
 /* ------------------------------------------------------------------ */
 
 /* Wraps the body and fits the header of post idx into the layout cache, so
    that ui_draw_post() needs no measuring, and returns the post height.
    Must stay in step with how ui_draw_post() accumulates h. */
-static int ui_layout_post(int idx, const pspsky_post_t *post)
+static int ui_layout_post(int idx, const pspsky_post_t *post,
+                          const pspsky_ui_tl_image_t *img)
 {
     ui_post_cache_t *c = &s_post_cache[idx];
     char             namebuf[UI_NAME_BUF];
@@ -507,9 +658,7 @@ static int ui_layout_post(int idx, const pspsky_post_t *post)
     }
 
     h = UI_LINE_H + UI_TIME_LINE_H + lines * UI_LINE_H + UI_POST_PAD;
-    if (post->has_embed) {
-        h += UI_LINE_H;   /* one line for the UI_EMBED_MARK marker */
-    }
+    h += ui_post_extra_h(post, img);
     return h;
 }
 
@@ -532,7 +681,7 @@ static void ui_rebuild_layout(const pspsky_ui_timeline_view_t *view)
 
     for (i = 0; i < n; i++) {
         s_post_top[i] = y;
-        y += ui_layout_post(i, &view->posts[i]);
+        y += ui_layout_post(i, &view->posts[i], ui_tl_image(view, i));
     }
     s_post_top[n]  = y;
     s_content_h    = y;
@@ -554,15 +703,16 @@ static int ui_max_scroll(void)
 /* idx indexes the layout cache built by ui_layout_post(); it must be < the
    s_layout_count that the current s_layout_valid covers. */
 static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
-                         long long now_unix)
+                         long long now_unix, const pspsky_ui_tl_image_t *img)
 {
     const ui_post_cache_t *c = &s_post_cache[idx];
     char        hsrc[UI_HSRC_BUF];
     char        namebuf[UI_NAME_BUF];     /* display name or handle + ellipsis */
     char        handlebuf[UI_HANDLE_BUF];
+    char        markbuf[32];
     char        tbuf[24];
     const char *name;
-    int         body_top, lines, i, h;
+    int         body_top, lines, i, h, below;
 
     name = (post->display_name[0] != '\0') ? post->display_name : post->handle;
 
@@ -607,19 +757,40 @@ static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
                 ui_cached_line(post->text, idx, i));
     }
 
-    h = UI_LINE_H + UI_TIME_LINE_H + lines * UI_LINE_H + UI_POST_PAD;
+    h     = UI_LINE_H + UI_TIME_LINE_H + lines * UI_LINE_H + UI_POST_PAD;
+    below = body_top + lines * UI_LINE_H;
 
-    /* Presence only; the embed contents are never inspected. */
-    if (post->has_embed) {
-        int my = body_top + lines * UI_LINE_H;
+    /* Same three cases as ui_post_extra_h(), which supplies the height. */
+    if (img != NULL) {
+        int iy = below + UI_TL_IMG_GAP;
 
-        if (my + UI_LINE_H >= UI_LIST_TOP && my <= UI_LIST_BOTTOM) {
+        if (iy + img->h >= UI_LIST_TOP && iy <= UI_LIST_BOTTOM) {
+            ui_tl_draw_image(idx, img, UI_MARGIN_X, iy);
+        }
+        if (post->img_count >= 2) {
+            int my = iy + img->h;
+
+            if (my + UI_LINE_H >= UI_LIST_TOP && my <= UI_LIST_BOTTOM) {
+                ui_text(UI_SIZE_NAME, UI_COL_DIM,
+                        (float)UI_MARGIN_X, (float)(my + UI_BASELINE),
+                        ui_img_mark(post, markbuf, sizeof markbuf));
+            }
+        }
+    } else if (post->img_count >= 1) {
+        if (below + UI_LINE_H >= UI_LIST_TOP && below <= UI_LIST_BOTTOM) {
             ui_text(UI_SIZE_NAME, UI_COL_DIM,
-                    (float)UI_MARGIN_X, (float)(my + UI_BASELINE),
+                    (float)UI_MARGIN_X, (float)(below + UI_BASELINE),
+                    ui_img_mark(post, markbuf, sizeof markbuf));
+        }
+    } else if (post->has_embed) {
+        /* Presence only; the embed contents are never inspected. */
+        if (below + UI_LINE_H >= UI_LIST_TOP && below <= UI_LIST_BOTTOM) {
+            ui_text(UI_SIZE_NAME, UI_COL_DIM,
+                    (float)UI_MARGIN_X, (float)(below + UI_BASELINE),
                     UI_EMBED_MARK);
         }
-        h += UI_LINE_H;   /* keep in step with ui_layout_post() */
     }
+    h += ui_post_extra_h(post, img);
 
     /* separator line */
     ui_draw_rect(UI_MARGIN_X, top + h - 3, UI_SCR_W - UI_MARGIN_X * 2, 1, UI_COL_SEP);
@@ -1182,6 +1353,8 @@ static void ui_prev_draw(const pspsky_ui_preview_t *pv, int has_img,
 
 int pspsky_ui_init(void)
 {
+    int i;
+
     if (s_inited) {
         return PSPSKY_OK;
     }
@@ -1236,6 +1409,10 @@ int pspsky_ui_init(void)
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
+    for (i = 0; i < UI_TL_TEX_SLOTS; i++) {
+        s_tl_tex_post[i] = -1;
+    }
+    s_tl_tex_next  = 0;
     s_prev_buttons = 0;
     s_scroll       = 0;
     s_content_h    = 0;
@@ -1549,7 +1726,14 @@ int pspsky_ui_preview_image(const pspsky_ui_preview_t *pv)
 
 void pspsky_ui_timeline_invalidate(int reset_scroll)
 {
+    int i;
+
     s_layout_valid = 0;
+    /* The posts array is about to change and main may free the rgb buffers, so
+       no slot may go on claiming to hold a given post index. */
+    for (i = 0; i < UI_TL_TEX_SLOTS; i++) {
+        s_tl_tex_post[i] = -1;
+    }
     if (reset_scroll) {
         s_scroll = 0;
     }
@@ -1633,7 +1817,8 @@ pspsky_ui_action_t pspsky_ui_timeline_frame(const pspsky_ui_timeline_view_t *vie
             }
             /* intraFont may change the scissor. */
             sceGuScissor(0, UI_LIST_TOP, UI_SCR_W, UI_LIST_H);
-            ui_draw_post(&view->posts[i], i, top, view->now_unix);
+            ui_draw_post(&view->posts[i], i, top, view->now_unix,
+                         ui_tl_image(view, i));
         }
         sceGuScissor(0, 0, UI_SCR_W, UI_SCR_H);
         ui_draw_scrollbar();

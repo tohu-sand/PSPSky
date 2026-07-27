@@ -407,14 +407,17 @@ static int curl_transport_perform(void *ctx,
     curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 30L);
-    /* ~2MB over 802.11b can exceed 60 s, so only uploads get 180 s. */
+    /* ~2MB over 802.11b can exceed 60 s, so only uploads get 180 s. A caller
+       that states its own budget (thumbnails) overrides both. */
     curl_easy_setopt(easy, CURLOPT_TIMEOUT,
-                     (req->body_bin != NULL) ? 180L : 60L);
+                     (req->timeout_sec > 0)
+                         ? (long)req->timeout_sec
+                         : ((req->body_bin != NULL) ? 180L : 60L));
     curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(easy, CURLOPT_MAXREDIRS, 3L);
     curl_easy_setopt(easy, CURLOPT_USERAGENT,
-                     "PSPSky/1.0.1 (PlayStation Portable; ARK-4)");
+                     "PSPSky/1.1.0 (PlayStation Portable; ARK-4)");
     curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, (void *)&buf);

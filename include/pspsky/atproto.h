@@ -15,6 +15,7 @@
 #define PSPSKY_MAX_CURSOR      128
 #define PSPSKY_MAX_POSTS       20    /* max posts per getTimeline call */
 #define PSPSKY_ERRMSG_MAX      160
+#define PSPSKY_MAX_THUMB_URL   256
 
 #define PSPSKY_MAX_BLOB_CID    256
 #define PSPSKY_MAX_BLOB_MIME   64
@@ -35,9 +36,13 @@ typedef struct {
     char created_at[PSPSKY_MAX_CREATEDAT];
     long long created_at_unix;                 /* UTC epoch seconds; -1 if unparsable */
     int  has_embed;                            /* 1 = record.embed present; contents never read */
+    char thumb_url[PSPSKY_MAX_THUMB_URL];      /* first image thumb URL; empty = none */
+    int  img_count;                            /* images in the embed view; 0 = none */
+    int  img_aspect_w;                         /* aspectRatio of the first image; 0 = unknown */
+    int  img_aspect_h;
 } pspsky_post_t;
 
-/* ~30KB, keep off the stack */
+/* ~36KB, keep off the stack */
 typedef struct {
     pspsky_post_t posts[PSPSKY_MAX_POSTS];
     int  count;
@@ -81,6 +86,13 @@ int pspsky_atp_create_post(const pspsky_transport_t *t,
                            const pspsky_session_t *sess,
                            const char *text_utf8,
                            const char *created_at_iso,
+                           char *errmsg);
+
+/* GET url with no auth and a 15 s timeout. On HTTP 200 hands over the
+   malloc'd body (caller frees); any other status maps to E_HTTP. */
+int pspsky_atp_fetch_image(const pspsky_transport_t *t,
+                           const char *url,
+                           unsigned char **out, size_t *out_len,
                            char *errmsg);
 
 /* POST com.atproto.repo.uploadBlob; data is sent verbatim as mime_type */

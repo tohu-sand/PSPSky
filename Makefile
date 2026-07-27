@@ -1,13 +1,22 @@
 TARGET = PSPSKY
+
+# libwebp decoder sources, compiled from the vendored tree as-is.
+WEBP_OBJS = $(patsubst %.c,%.o,\
+            $(wildcard vendor/libwebp/src/dec/*.c) \
+            $(wildcard vendor/libwebp/src/dsp/*.c) \
+            $(wildcard vendor/libwebp/src/utils/*.c))
+
 OBJS = vendor/cjson/cJSON.o \
        vendor/picojpeg/picojpeg.o \
+       $(WEBP_OBJS) \
        src/core/error.o src/core/strings.o src/core/utf8.o src/core/timeutil.o src/core/atproto.o \
        src/core/jpeg.o src/core/jpeg_thumb.o src/core/png.o src/core/png_thumb.o \
+       src/core/webp_thumb.o \
        src/psp/net.o src/psp/transport_curl.o src/psp/config.o \
        src/psp/osk.o src/psp/ui.o src/psp/main.o
 
 INCDIR   =
-CFLAGS   = -O2 -G0 -Wall -std=gnu99 -Iinclude -Ivendor
+CFLAGS   = -O2 -G0 -Wall -std=gnu99 -Iinclude -Ivendor -Ivendor/libwebp -Ivendor/libwebp/src
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS  = $(CFLAGS)
 

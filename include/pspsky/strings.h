@@ -15,8 +15,9 @@ void pspsky_lang_set(pspsky_lang_t lang);
 pspsky_lang_t pspsky_lang_get(void);
 
 /* Values and ordering must match the tables in src/core/strings.c.
-   TIME_MIN/HOUR/DAY_AGO and TRC_CONNECT_FAIL/TRC_COMM_FAIL are printf formats
-   with one %d; TRC_TLS_HANDSHAKE has one %s; the rest have no specifiers. */
+   TIME_MIN/HOUR/DAY_AGO, TRC_CONNECT_FAIL/TRC_COMM_FAIL and UI_IMG_MARK_N are
+   printf formats with one %d; ST_FETCHING_IMAGES has two %d; TRC_TLS_HANDSHAKE
+   has one %s; the rest have no specifiers. */
 typedef enum {
     /* --- A. error.c: pspsky_strerror --- */
     PSPSKY_STR_ERR_OK = 0,
@@ -51,6 +52,7 @@ typedef enum {
     PSPSKY_STR_UI_HINT_OK,
     PSPSKY_STR_UI_HINT_YES_NO,
     PSPSKY_STR_UI_EMBED_MARK,
+    PSPSKY_STR_UI_IMG_MARK_N,
     PSPSKY_STR_UI_PREV_TITLE,
     PSPSKY_STR_UI_PREV_NO_IMAGE,
     PSPSKY_STR_UI_PREV_NO_IMAGE_SUB,
@@ -68,6 +70,7 @@ typedef enum {
     PSPSKY_STR_ST_LOGGING_IN,
     PSPSKY_STR_ST_TIMELINE_LOADING,
     PSPSKY_STR_ST_LOADING_MORE,
+    PSPSKY_STR_ST_FETCHING_IMAGES,
     PSPSKY_STR_ST_POSTING,
     PSPSKY_STR_ST_UPLOADING,
     PSPSKY_STR_ST_PREVIEW_PREP,

@@ -12,6 +12,7 @@ The PSP connects **directly to `bsky.social` over TLS 1.2** (libcurl + mbedTLS, 
 
 - Runs standalone on the PSP — no relay server or proxy sitting between you and Bluesky. The PSP makes a direct TLS connection to `bsky.social` (with CA verification).
 - Home timeline — shows display name (falling back to handle), handle, post text, and a relative timestamp ("5m ago", "3h ago"). Cursor-based paging loads up to 100 posts in total.
+- Timeline thumbnails — posts with images show the first one as a thumbnail below the text (aspect ratio preserved). Posts with two or more images also carry an `[images x3]` count. Can be turned off in the configuration file.
 - Text posting — composed with the on-screen keyboard (Japanese supported, up to 300 characters).
 - Image attachment — one JPEG or PNG per post (2,000,000 bytes or less). A thumbnail preview appears before sending, and an ALT text can be added optionally.
 
@@ -66,6 +67,7 @@ A plain text file placed at `ms0:/PSP/GAME/PSPSKY/pspsky.cfg`.
 identifier=user.bsky.social
 password=xxxx-xxxx-xxxx-xxxx
 lang=en
+images=on
 ```
 
 | Key | Meaning |
@@ -73,6 +75,7 @@ lang=en
 | `identifier` | Your Bluesky handle (no `@`; use the domain itself for a custom domain) |
 | `password` | Your app password (`xxxx-xxxx-xxxx-xxxx`, hyphens included) |
 | `lang` | Pins the UI language to `ja` or `en`. Optional (auto-detected if omitted) |
+| `images` | Timeline thumbnails: `on` (default) or `off`. Optional. With `off` no images are fetched and only the marker is drawn, saving bandwidth and loading time |
 
 - Do not put spaces around `=`, and no quotes are needed. The order of lines does not matter.
 - If the file does not exist, you are prompted on the on-screen keyboard at startup and the values are saved automatically after a successful login. Delete the file to re-enter them.
@@ -100,7 +103,13 @@ The PSP has no secure key storage, and a key placed anywhere the EBOOT can read 
 | X | Cancel (on the image preview screen: choose a different file) |
 | START | Quit |
 
-Posts that contain an image are marked with `[image]` (`[画像]` in the Japanese UI) below the post text in the timeline.
+### Images in the timeline
+
+Posts that contain an image show the first one as a thumbnail below the post text, with the aspect ratio preserved. When a post has two or more images, an `[images x3]` count (`[画像 x3]` in the Japanese UI) appears under the thumbnail.
+
+When a thumbnail cannot be shown, the post falls back to an `[image]` marker (`[画像]` in the Japanese UI) instead. Embeds that carry no image at all — quote posts, link cards — still show only the marker, as before.
+
+Progress is reported as "Fetching images (n/m)..." while they load; budget roughly 0.2-0.5 seconds per image.
 
 ### Posting with an image
 
@@ -157,6 +166,7 @@ The script fetches from `https://curl.se/ca/cacert.pem`. If the network is unava
 ├── assets/cacert.pem        CA bundle
 ├── vendor/cjson/            cJSON v1.7.18 (vendored)
 ├── vendor/picojpeg/         picojpeg (vendored)
+├── vendor/libwebp/          libwebp (vendored, decoder only)
 ├── include/pspsky/          Shared headers
 ├── src/core/                Portable core (C99, no PSP dependencies)
 └── src/psp/                 PSP shell (networking, OSK, UI, entry point)
@@ -180,6 +190,8 @@ TLS-related error screens include an error code in the form `(curl:number)`.
 | "please wait and retry" | Bluesky-side rate limiting. Wait a few minutes and refresh with L |
 | Returns to the XMB right after launch | The copy of `EBOOT.PBP` may be corrupt — copy it again. Also check that the CFW is active |
 | Japanese text is missing or garbled | The console font `flash0:/font/jpn0.pgf` may be unavailable (e.g. on non-Japanese consoles) |
+| An `[image]` marker appears instead of a thumbnail | Either the fetch failed (weak signal, access point dropped), the image format is unsupported, the image cache hit its ceiling (about 4 MB), or `images=off` is set in `pspsky.cfg`. Refreshing with L retries them |
+| The timeline is slow to load | Each image costs roughly 0.2-0.5 seconds to fetch. Adding `images=off` to `pspsky.cfg` skips image fetching and speeds loading up (remove the line to restore it) |
 
 ---
 
@@ -187,4 +199,4 @@ TLS-related error screens include an error code in the form `(curl:number)`.
 
 This project is released under the MIT License. See the [LICENSE](LICENSE) file for details.
 
-For the licenses of bundled and linked third-party software (cJSON, picojpeg, libcurl, mbedTLS, zlib, intraFont, and the root certificate bundle), see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+For the licenses of bundled and linked third-party software (cJSON, picojpeg, libwebp, libcurl, mbedTLS, zlib, intraFont, and the root certificate bundle), see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

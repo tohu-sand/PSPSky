@@ -24,6 +24,16 @@ typedef enum {
 
 #define PSPSKY_UI_PICK_PATH_MAX 512
 
+#define PSPSKY_UI_TL_IMG_MAX_W 256
+#define PSPSKY_UI_TL_IMG_MAX_H 120
+
+/* One timeline thumbnail owned by main; entries parallel the posts array */
+typedef struct {
+    const unsigned char *rgb; /* packed RGB888, stride w*3; NULL = marker only */
+    short w;                  /* 1..PSPSKY_UI_TL_IMG_MAX_W when rgb is set */
+    short h;                  /* 1..PSPSKY_UI_TL_IMG_MAX_H when rgb is set */
+} pspsky_ui_tl_image_t;
+
 /* Read-only view of the timeline model owned by main */
 typedef struct {
     const pspsky_post_t *posts;
@@ -31,6 +41,7 @@ typedef struct {
     int has_more;               /* 1 = a cursor exists */
     long long now_unix;         /* reference for relative times */
     const char *my_handle;      /* shown in the header; may be NULL */
+    const pspsky_ui_tl_image_t *images; /* parallel to posts; NULL = no thumbnails */
 } pspsky_ui_timeline_view_t;
 
 /* GU init plus intraFont (flash0:/font/jpn0.pgf, falling back to ltn0.pgf) */
@@ -74,7 +85,8 @@ int pspsky_ui_preview_image(const pspsky_ui_preview_t *pv);
    internal */
 pspsky_ui_action_t pspsky_ui_timeline_frame(const pspsky_ui_timeline_view_t *view);
 
-/* Call after main appends to or clears the posts array */
+/* Call after main appends to or clears the posts array; it also drops the
+   cached thumbnail textures, so it must run before any images[].rgb is freed */
 void pspsky_ui_timeline_invalidate(int reset_scroll);
 
 #endif /* PSPSKY_UI_H */

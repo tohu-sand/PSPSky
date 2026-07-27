@@ -77,6 +77,8 @@ static const char *const k_ja[PSPSKY_STR_COUNT] = {
         "○:はい ×:いいえ",
     [PSPSKY_STR_UI_EMBED_MARK] =
         "[画像]",
+    [PSPSKY_STR_UI_IMG_MARK_N] =
+        "[画像 x%d]",
     [PSPSKY_STR_UI_PREV_TITLE] =
         "画像プレビュー",
     [PSPSKY_STR_UI_PREV_NO_IMAGE] =
@@ -110,6 +112,8 @@ static const char *const k_ja[PSPSKY_STR_COUNT] = {
         "タイムライン取得中...",
     [PSPSKY_STR_ST_LOADING_MORE] =
         "さらに読み込み中...",
+    [PSPSKY_STR_ST_FETCHING_IMAGES] =
+        "画像を取得中 (%d/%d)...",
     [PSPSKY_STR_ST_POSTING] =
         "投稿中...",
     [PSPSKY_STR_ST_UPLOADING] =
@@ -234,6 +238,8 @@ static const char *const k_en[PSPSKY_STR_COUNT] = {
         "O:Yes X:No",
     [PSPSKY_STR_UI_EMBED_MARK] =
         "[image]",
+    [PSPSKY_STR_UI_IMG_MARK_N] =
+        "[images x%d]",
     [PSPSKY_STR_UI_PREV_TITLE] =
         "Image preview",
     [PSPSKY_STR_UI_PREV_NO_IMAGE] =
@@ -267,6 +273,8 @@ static const char *const k_en[PSPSKY_STR_COUNT] = {
         "Loading timeline...",
     [PSPSKY_STR_ST_LOADING_MORE] =
         "Loading more...",
+    [PSPSKY_STR_ST_FETCHING_IMAGES] =
+        "Fetching images (%d/%d)...",
     [PSPSKY_STR_ST_POSTING] =
         "Posting...",
     [PSPSKY_STR_ST_UPLOADING] =

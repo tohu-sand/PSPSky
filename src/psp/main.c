@@ -19,6 +19,7 @@
 #include "pspsky/atproto.h"
 #include "pspsky/jpeg.h"
 #include "pspsky/png.h"
+#include "pspsky/webp.h"
 #include "pspsky/transport.h"
 #include "pspsky/transport_curl.h"
 #include "pspsky/config.h"
@@ -29,7 +30,7 @@
 #include "pspsky/utf8.h"
 #include "pspsky/timeutil.h"
 
-PSP_MODULE_INFO("PSPSky", 0, 1, 0);
+PSP_MODULE_INFO("PSPSky", 0, 1, 1);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(-2048);
 
@@ -43,6 +44,9 @@ PSP_HEAP_SIZE_KB(-2048);
 #define APP_LOGIN_TRIES     3     /* max login attempts             */
 #define APP_NET_CONF_INDEX  1     /* connection profile 1           */
 #define APP_NET_TIMEOUT_SEC 45
+
+/* Heap spent on decoded timeline thumbnails; past it, posts keep the marker. */
+#define APP_IMG_CACHE_MAX   (4 * 1024 * 1024)
 
 #define APP_DEFAULT_BASEDIR "ms0:/PSP/GAME/PSPSKY/"
 
@@ -65,8 +69,15 @@ static int                g_post_count;
 static char               g_cursor[PSPSKY_MAX_CURSOR];
 static int                g_has_more;
 
+/* Thumbnails parallel to g_posts; rgb is malloc'd and owned here. */
+static pspsky_ui_tl_image_t g_tl_images[APP_MAX_POSTS];
+static size_t               g_img_cache_bytes;
+/* Decode scratch, reused for every thumbnail. ~90KB. */
+static unsigned char g_img_work[PSPSKY_UI_TL_IMG_MAX_W *
+                                PSPSKY_UI_TL_IMG_MAX_H * 3];
+
 static pspsky_client_t    g_client;    /* ~5KB  */
-static pspsky_timeline_t  g_tl;        /* ~30KB */
+static pspsky_timeline_t  g_tl;        /* ~36KB */
 static pspsky_transport_t g_transport;
 static pspsky_config_t    g_cfg;
 /* Result of the single config load done by init_language(). */
@@ -374,6 +385,99 @@ static void show_error(int err)
 /* Timeline model                                                      */
 /* ------------------------------------------------------------------ */
 
+/* Drops every cached thumbnail. The UI caches textures by post index, so it
+   has to let go of them before the buffers behind them are freed. */
+static void img_cache_clear(void)
+{
+    int i;
+
+    pspsky_ui_timeline_invalidate(0);
+    for (i = 0; i < APP_MAX_POSTS; i++) {
+        free((void *)g_tl_images[i].rgb);
+    }
+    memset(g_tl_images, 0, sizeof(g_tl_images));
+    g_img_cache_bytes = 0;
+}
+
+/* Fetches and decodes the first thumbnail of each post in
+   [start, g_post_count). Every failure is silent: the post keeps its marker. */
+static void fetch_new_images(int start)
+{
+    char msg[128];
+    int  i;
+    int  m = 0;
+    int  n = 0;
+
+    if (!g_cfg.show_images) {
+        return;
+    }
+    for (i = start; i < g_post_count; i++) {
+        if (g_posts[i].thumb_url[0] != '\0') {
+            m++;
+        }
+    }
+    if (m == 0) {
+        return;
+    }
+
+    for (i = start; i < g_post_count; i++) {
+        unsigned char *body = NULL;
+        unsigned char *rgb;
+        size_t         len  = 0;
+        size_t         sz;
+        int            tw   = 0;
+        int            th   = 0;
+        int            sw   = 0;   /* source dims; unused, tw/th are shown */
+        int            sh   = 0;
+        int            decoded;
+
+        if (g_posts[i].thumb_url[0] == '\0') {
+            continue;
+        }
+        n++;
+        /* Budget spent: stop paying for transfers that cannot be kept. */
+        if (g_img_cache_bytes >= (size_t)APP_IMG_CACHE_MAX) {
+            continue;
+        }
+
+        snprintf(msg, sizeof(msg), pspsky_tr(PSPSKY_STR_ST_FETCHING_IMAGES),
+                 n, m);
+        pspsky_ui_status(msg);
+
+        /* The reason never reaches the user, so no errmsg buffer is kept. */
+        decoded = 0;
+        if (pspsky_atp_fetch_image(&g_transport, g_posts[i].thumb_url,
+                                   &body, &len, NULL) == PSPSKY_OK &&
+            pspsky_webp_thumb_decode(body, len,
+                                     PSPSKY_UI_TL_IMG_MAX_W,
+                                     PSPSKY_UI_TL_IMG_MAX_H,
+                                     g_img_work, sizeof(g_img_work),
+                                     &tw, &th, &sw, &sh) == PSPSKY_OK) {
+            decoded = 1;
+        }
+        /* fetch_image leaves body NULL unless it handed one over. */
+        free(body);
+        if (!decoded) {
+            printf("PSPSky: thumbnail %d unavailable\n", i);
+            continue;
+        }
+
+        sz = (size_t)tw * (size_t)th * 3u;
+        if (g_img_cache_bytes + sz > (size_t)APP_IMG_CACHE_MAX) {
+            continue;
+        }
+        rgb = (unsigned char *)malloc(sz);
+        if (rgb == NULL) {
+            continue;
+        }
+        memcpy(rgb, g_img_work, sz);
+        g_tl_images[i].rgb = rgb;
+        g_tl_images[i].w   = (short)tw;
+        g_tl_images[i].h   = (short)th;
+        g_img_cache_bytes += sz;
+    }
+}
+
 static void timeline_clear(void)
 {
     g_post_count = 0;
@@ -404,8 +508,10 @@ static int timeline_reload(void)
     if (rc != PSPSKY_OK) {
         return rc;
     }
+    img_cache_clear();
     timeline_clear();
     timeline_append(&g_tl);
+    fetch_new_images(0);
     pspsky_ui_timeline_invalidate(1);
     return PSPSKY_OK;
 }
@@ -424,7 +530,12 @@ static int timeline_load_older(void)
     if (rc != PSPSKY_OK) {
         return rc;
     }
-    timeline_append(&g_tl);
+    {
+        int added_from = g_post_count;
+
+        timeline_append(&g_tl);
+        fetch_new_images(added_from);
+    }
     pspsky_ui_timeline_invalidate(0);
     return PSPSKY_OK;
 }
@@ -827,6 +938,7 @@ static void app_main_loop(void)
         view.has_more  = g_has_more;
         view.now_unix  = now_unix();
         view.my_handle = g_client.session.handle;
+        view.images    = g_tl_images;
 
         act = pspsky_ui_timeline_frame(&view);
         rc  = PSPSKY_OK;
@@ -968,6 +1080,7 @@ quit_net:
     pspsky_net_disconnect();
     pspsky_net_term();
 quit_ui:
+    img_cache_clear();
     pspsky_ui_term();
     sceKernelExitGame();
     return 0;

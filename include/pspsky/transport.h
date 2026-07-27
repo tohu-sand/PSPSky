@@ -17,6 +17,7 @@ typedef struct {
     const unsigned char *body_bin; /* raw bytes, sent verbatim */
     size_t body_bin_len;
     const char *content_type;      /* required with body_bin */
+    int timeout_sec;               /* 0 = implementation default */
 } pspsky_http_req_t;
 
 typedef struct {
