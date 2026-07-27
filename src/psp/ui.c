@@ -75,6 +75,12 @@
 /* Internal limits */
 #define UI_MAX_LAYOUT_POSTS 128   /* main caps the timeline at 100 posts */
 #define UI_WRAP_MAX_LINES   64
+/* Post header buffers. ui_fit_head_calc() and ui_fit_head_apply() must be
+   handed the same cap for a given string, so the sizes are named here rather
+   than spelled out at each call site. */
+#define UI_NAME_BUF         (PSPSKY_MAX_HANDLE + 8)    /* fitted name        */
+#define UI_HSRC_BUF         (PSPSKY_MAX_HANDLE + 8)    /* " @handle" source  */
+#define UI_HANDLE_BUF       (PSPSKY_MAX_HANDLE + 16)   /* fitted " @handle"  */
 #define UI_MSG_W            400.0f
 #define UI_GU_LIST_WORDS    32768 /* 128KB: intraFont allocates via sceGuGetMemory */
 
@@ -127,6 +133,35 @@ static int          s_post_top[UI_MAX_LAYOUT_POSTS + 1];
 static int  s_wrap_start[UI_WRAP_MAX_LINES];
 static int  s_wrap_len[UI_WRAP_MAX_LINES];
 static char s_line_buf[PSPSKY_MAX_TEXT + 1];
+
+/* Per-post layout cache, filled by ui_rebuild_layout() and read by
+   ui_draw_post(). It exists so the timeline draw path never calls
+   intraFontMeasureText: on hardware, re-wrapping every visible post one code
+   point at a time on every frame is what made deep scrolling crawl. Valid
+   exactly while s_layout_valid is set, for the first s_layout_count posts, so
+   it is invalidated by pspsky_ui_timeline_invalidate() along with s_post_top.
+   Same semantics as s_wrap_start/s_wrap_len: byte offset into post->text and
+   byte length, both well under a short (PSPSKY_MAX_TEXT is 1024). 32KB. */
+static short s_pw_start[UI_MAX_LAYOUT_POSTS][UI_WRAP_MAX_LINES];
+static short s_pw_len[UI_MAX_LAYOUT_POSTS][UI_WRAP_MAX_LINES];
+
+/* A ui_fit_head() result kept as "copy this many bytes of the source, then
+   maybe an ellipsis" instead of as the fitted string. Rebuilding from it is a
+   memcpy, and it costs 4 bytes per string instead of a 264-byte buffer. */
+typedef struct {
+    short cut;   /* bytes of the source kept */
+    short ell;   /* 1 = the ellipsis follows */
+} ui_fit_cache_t;
+
+typedef struct {
+    ui_fit_cache_t name;       /* display name (or handle), truncated  */
+    ui_fit_cache_t handle;     /* " @handle", truncated                */
+    short          lines;      /* wrapped body line count              */
+    short          has_handle; /* 1 = the @handle is drawn at all      */
+    float          handle_x;   /* pen x for the @handle                */
+} ui_post_cache_t;
+
+static ui_post_cache_t s_post_cache[UI_MAX_LAYOUT_POSTS];
 
 /* About 26KB, so kept off the stack. */
 typedef struct {
@@ -309,54 +344,69 @@ static int ui_wrap(const char *text, float size, float max_w)
     return nlines;
 }
 
-/* Copies wrapped line i into a NUL-terminated buffer. */
-static const char *ui_wrap_line(const char *text, int i)
+/* Copies text[start .. start+len) into a NUL-terminated buffer. */
+static const char *ui_copy_line(const char *text, int start, int len)
 {
-    int len = s_wrap_len[i];
-
     if (len > (int)sizeof(s_line_buf) - 1) {
         len = (int)sizeof(s_line_buf) - 1;
     }
     if (len > 0) {
-        memcpy(s_line_buf, text + s_wrap_start[i], (size_t)len);
+        memcpy(s_line_buf, text + start, (size_t)len);
     }
     s_line_buf[(len > 0) ? len : 0] = '\0';
     return s_line_buf;
+}
+
+/* Copies wrapped line i into a NUL-terminated buffer. */
+static const char *ui_wrap_line(const char *text, int i)
+{
+    return ui_copy_line(text, s_wrap_start[i], s_wrap_len[i]);
+}
+
+/* Same, from the per-post cache rather than the shared wrap result. */
+static const char *ui_cached_line(const char *text, int idx, int i)
+{
+    return ui_copy_line(text, s_pw_start[idx][i], s_pw_len[idx][i]);
 }
 
 /* ------------------------------------------------------------------ */
 /* Head-first truncation                                               */
 /* ------------------------------------------------------------------ */
 
-/* Fits src into max_w px, dropping the tail and appending an ellipsis. */
-static const char *ui_fit_head(const char *src, float size, float max_w,
-                               char *buf, size_t cap)
+static const char ui_ell[] = "…";   /* sizeof is 4, NUL included */
+
+/* Works out how src has to be cut to fit into max_w px when the tail is
+   dropped and an ellipsis appended. This is the measuring half of the old
+   ui_fit_head(); it runs at layout time only, and ui_fit_head_apply() rebuilds
+   the string from the result without touching the font. */
+static void ui_fit_head_calc(const char *src, float size, float max_w,
+                             size_t cap, ui_fit_cache_t *out)
 {
-    static const char ell[] = "…";   /* sizeof is 4, NUL included */
-    const char *p     = src;
-    size_t      used  = 0;
-    float       w     = 0.0f;
+    const char *p    = src;
+    size_t      used = 0;
+    float       w    = 0.0f;
     float       avail;
     char        cbuf[8];
 
-    if (buf == NULL || cap == 0) {
-        return "";
+    out->cut = 0;
+    out->ell = 0;
+    if (cap == 0) {
+        return;
     }
-    buf[0] = '\0';
     if (!s_font || src == NULL || src[0] == '\0' || max_w <= 0.0f) {
-        return buf;
+        return;
     }
 
     intraFontSetStyle(s_font, size, UI_COL_TEXT, 0, 0.0f, 0);
     if (strlen(src) < cap && intraFontMeasureText(s_font, src) <= max_w) {
-        memcpy(buf, src, strlen(src) + 1);
-        return buf;   /* fits as-is */
+        out->cut = (short)strlen(src);
+        return;   /* fits as-is */
     }
 
-    avail = max_w - intraFontMeasureText(s_font, ell);
+    avail = max_w - intraFontMeasureText(s_font, ui_ell);
     if (avail < 0.0f) {
         /* The ellipsis alone does not fit: emit nothing. */
-        return buf;
+        return;
     }
     for (;;) {
         const char *cp_start = p;
@@ -370,7 +420,7 @@ static const char *ui_fit_head(const char *src, float size, float max_w,
         if (cp_bytes <= 0 || cp_bytes >= (int)sizeof cbuf) {
             break;
         }
-        if (used + (size_t)cp_bytes + sizeof ell > cap) {
+        if (used + (size_t)cp_bytes + sizeof ui_ell > cap) {
             break;   /* always leave room for the ellipsis and the NUL */
         }
         memcpy(cbuf, cp_start, (size_t)cp_bytes);
@@ -379,12 +429,33 @@ static const char *ui_fit_head(const char *src, float size, float max_w,
         if (w + cw > avail) {
             break;
         }
-        memcpy(buf + used, cbuf, (size_t)cp_bytes);
         used += (size_t)cp_bytes;
         w    += cw;
     }
-    if (used + sizeof ell <= cap) {
-        memcpy(buf + used, ell, sizeof ell);   /* copy including the NUL */
+    out->cut = (short)used;
+    out->ell = (used + sizeof ui_ell <= cap) ? 1 : 0;
+}
+
+/* Rebuilds the string ui_fit_head_calc() described. Pure memcpy: no measuring,
+   so this is what the per-frame draw path calls. */
+static const char *ui_fit_head_apply(const char *src, const ui_fit_cache_t *fc,
+                                     char *buf, size_t cap)
+{
+    size_t used;
+
+    if (buf == NULL || cap == 0) {
+        return "";
+    }
+    buf[0] = '\0';
+    used = (fc->cut > 0) ? (size_t)fc->cut : 0;
+    if (src == NULL || used >= cap) {
+        return buf;   /* used >= cap cannot happen: calc() used the same cap */
+    }
+    if (used > 0) {
+        memcpy(buf, src, used);
+    }
+    if (fc->ell && used + sizeof ui_ell <= cap) {
+        memcpy(buf + used, ui_ell, sizeof ui_ell);   /* copy including the NUL */
     } else {
         buf[used] = '\0';
     }
@@ -395,12 +466,47 @@ static const char *ui_fit_head(const char *src, float size, float max_w,
 /* Timeline layout                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Must stay in step with how ui_draw_post() accumulates h. */
-static int ui_post_height(const pspsky_post_t *post)
+/* Wraps the body and fits the header of post idx into the layout cache, so
+   that ui_draw_post() needs no measuring, and returns the post height.
+   Must stay in step with how ui_draw_post() accumulates h. */
+static int ui_layout_post(int idx, const pspsky_post_t *post)
 {
-    int lines = ui_wrap(post->text, UI_SIZE_BODY, UI_BODY_W);
-    int h     = UI_LINE_H + UI_TIME_LINE_H + lines * UI_LINE_H + UI_POST_PAD;
+    ui_post_cache_t *c = &s_post_cache[idx];
+    char             namebuf[UI_NAME_BUF];
+    const char      *name;
+    float            w, avail;
+    int              lines, i, h;
 
+    lines = ui_wrap(post->text, UI_SIZE_BODY, UI_BODY_W);
+    if (lines > UI_WRAP_MAX_LINES) {
+        lines = UI_WRAP_MAX_LINES;
+    }
+    for (i = 0; i < lines; i++) {
+        s_pw_start[idx][i] = (short)s_wrap_start[i];
+        s_pw_len[idx][i]   = (short)s_wrap_len[i];
+    }
+    c->lines = (short)lines;
+
+    /* Header line: name, then @handle in whatever width is left. */
+    name = (post->display_name[0] != '\0') ? post->display_name : post->handle;
+    ui_fit_head_calc(name, UI_SIZE_NAME, UI_BODY_W, UI_NAME_BUF, &c->name);
+    w = ui_measure(UI_SIZE_NAME,
+                   ui_fit_head_apply(name, &c->name, namebuf, UI_NAME_BUF));
+    avail = UI_BODY_W - w;
+
+    c->handle_x   = (float)UI_MARGIN_X + w;
+    c->has_handle = 0;
+    c->handle.cut = 0;
+    c->handle.ell = 0;
+    if (post->handle[0] != '\0' && avail > 0.0f) {
+        char hsrc[UI_HSRC_BUF];
+
+        snprintf(hsrc, sizeof hsrc, " @%s", post->handle);
+        ui_fit_head_calc(hsrc, UI_SIZE_NAME, avail, UI_HANDLE_BUF, &c->handle);
+        c->has_handle = 1;
+    }
+
+    h = UI_LINE_H + UI_TIME_LINE_H + lines * UI_LINE_H + UI_POST_PAD;
     if (post->has_embed) {
         h += UI_LINE_H;   /* one line for the UI_EMBED_MARK marker */
     }
@@ -426,7 +532,7 @@ static void ui_rebuild_layout(const pspsky_ui_timeline_view_t *view)
 
     for (i = 0; i < n; i++) {
         s_post_top[i] = y;
-        y += ui_post_height(&view->posts[i]);
+        y += ui_layout_post(i, &view->posts[i]);
     }
     s_post_top[n]  = y;
     s_content_h    = y;
@@ -445,33 +551,32 @@ static int ui_max_scroll(void)
 /* Drawing a single post                                               */
 /* ------------------------------------------------------------------ */
 
-static void ui_draw_post(const pspsky_post_t *post, int top, long long now_unix)
+/* idx indexes the layout cache built by ui_layout_post(); it must be < the
+   s_layout_count that the current s_layout_valid covers. */
+static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
+                         long long now_unix)
 {
-    char        hsrc[PSPSKY_MAX_HANDLE + 8];
-    char        namebuf[PSPSKY_MAX_HANDLE + 8];   /* display name or handle + ellipsis */
-    char        handlebuf[PSPSKY_MAX_HANDLE + 16];
+    const ui_post_cache_t *c = &s_post_cache[idx];
+    char        hsrc[UI_HSRC_BUF];
+    char        namebuf[UI_NAME_BUF];     /* display name or handle + ellipsis */
+    char        handlebuf[UI_HANDLE_BUF];
     char        tbuf[24];
     const char *name;
-    const char *fit;
-    float       x, avail, w;
     int         body_top, lines, i, h;
 
     name = (post->display_name[0] != '\0') ? post->display_name : post->handle;
 
-    /* Header line: name, then @handle in whatever width is left. */
-    x     = (float)UI_MARGIN_X;
-    avail = UI_BODY_W;
+    /* Header line: name, then @handle in whatever width is left. Both were
+       fitted in ui_layout_post(), so rebuilding them here only copies bytes. */
+    ui_text(UI_SIZE_NAME, UI_COL_NAME, (float)UI_MARGIN_X,
+            (float)(top + UI_BASELINE),
+            ui_fit_head_apply(name, &c->name, namebuf, UI_NAME_BUF));
 
-    fit = ui_fit_head(name, UI_SIZE_NAME, avail, namebuf, sizeof namebuf);
-    ui_text(UI_SIZE_NAME, UI_COL_NAME, x, (float)(top + UI_BASELINE), fit);
-    w      = ui_measure(UI_SIZE_NAME, fit);
-    x     += w;
-    avail -= w;
-
-    if (post->handle[0] != '\0' && avail > 0.0f) {
+    if (c->has_handle) {
         snprintf(hsrc, sizeof hsrc, " @%s", post->handle);
-        fit = ui_fit_head(hsrc, UI_SIZE_NAME, avail, handlebuf, sizeof handlebuf);
-        ui_text(UI_SIZE_NAME, UI_COL_DIM, x, (float)(top + UI_BASELINE), fit);
+        ui_text(UI_SIZE_NAME, UI_COL_DIM, c->handle_x,
+                (float)(top + UI_BASELINE),
+                ui_fit_head_apply(hsrc, &c->handle, handlebuf, UI_HANDLE_BUF));
     }
 
     /* Timestamp line: right-aligned, dimmed, tighter than a body line. */
@@ -488,9 +593,9 @@ static void ui_draw_post(const pspsky_post_t *post, int top, long long now_unix)
                 (float)(top + UI_LINE_H + UI_TIME_BASELINE), tbuf);
     }
 
-    /* Body, wrapped to UI_BODY_W. */
+    /* Body, wrapped to UI_BODY_W by ui_layout_post(). */
     body_top = top + UI_LINE_H + UI_TIME_LINE_H;
-    lines    = ui_wrap(post->text, UI_SIZE_BODY, UI_BODY_W);
+    lines    = c->lines;
     for (i = 0; i < lines; i++) {
         int ly = body_top + i * UI_LINE_H;
 
@@ -499,7 +604,7 @@ static void ui_draw_post(const pspsky_post_t *post, int top, long long now_unix)
         }
         ui_text(UI_SIZE_BODY, UI_COL_TEXT,
                 (float)UI_MARGIN_X, (float)(ly + UI_BASELINE),
-                ui_wrap_line(post->text, i));
+                ui_cached_line(post->text, idx, i));
     }
 
     h = UI_LINE_H + UI_TIME_LINE_H + lines * UI_LINE_H + UI_POST_PAD;
@@ -513,7 +618,7 @@ static void ui_draw_post(const pspsky_post_t *post, int top, long long now_unix)
                     (float)UI_MARGIN_X, (float)(my + UI_BASELINE),
                     UI_EMBED_MARK);
         }
-        h += UI_LINE_H;   /* keep in step with ui_post_height() */
+        h += UI_LINE_H;   /* keep in step with ui_layout_post() */
     }
 
     /* separator line */
@@ -530,16 +635,23 @@ static void ui_draw_header(const char *my_handle)
     ui_text(UI_SIZE_HEADER, UI_COL_TEXT, 6.0f, 14.0f, "PSPSky");
 
     if (my_handle && my_handle[0] != '\0') {
+        /* Right-aligned, so it needs a width. The handle almost never changes,
+           so it is measured once and remembered rather than every frame. */
+        static char  cached[PSPSKY_MAX_HANDLE + 8];
+        static float cached_w;
         char  buf[PSPSKY_MAX_HANDLE + 8];
-        float w;
 
         if (my_handle[0] == '@') {
             snprintf(buf, sizeof(buf), "%s", my_handle);
         } else {
             snprintf(buf, sizeof(buf), "@%s", my_handle);
         }
-        w = ui_measure(UI_SIZE_HEADER, buf);
-        ui_text(UI_SIZE_HEADER, UI_COL_DIM, (float)UI_SCR_W - 6.0f - w, 14.0f, buf);
+        if (strcmp(buf, cached) != 0) {
+            cached_w = ui_measure(UI_SIZE_HEADER, buf);
+            memcpy(cached, buf, strlen(buf) + 1);
+        }
+        ui_text(UI_SIZE_HEADER, UI_COL_DIM,
+                (float)UI_SCR_W - 6.0f - cached_w, 14.0f, buf);
     }
 }
 
@@ -1105,10 +1217,13 @@ int pspsky_ui_init(void)
         sceGuTerm();
         return PSPSKY_E_IO;
     }
-    s_font = intraFontLoad("flash0:/font/jpn0.pgf", INTRAFONT_CACHE_MED);
+    /* CACHE_LARGE is a 512x512 glyph cache instead of 256x256. The medium one
+       holds about 100 glyphs, so a screen full of kanji thrashes it and every
+       frame re-rasterises glyphs it just evicted. */
+    s_font = intraFontLoad("flash0:/font/jpn0.pgf", INTRAFONT_CACHE_LARGE);
     if (!s_font) {
         printf("pspsky_ui_init: jpn0.pgf load failed, falling back to ltn0.pgf\n");
-        s_font = intraFontLoad("flash0:/font/ltn0.pgf", INTRAFONT_CACHE_MED);
+        s_font = intraFontLoad("flash0:/font/ltn0.pgf", INTRAFONT_CACHE_LARGE);
     }
     if (!s_font) {
         printf("pspsky_ui_init: no usable font\n");
@@ -1518,7 +1633,7 @@ pspsky_ui_action_t pspsky_ui_timeline_frame(const pspsky_ui_timeline_view_t *vie
             }
             /* intraFont may change the scissor. */
             sceGuScissor(0, UI_LIST_TOP, UI_SCR_W, UI_LIST_H);
-            ui_draw_post(&view->posts[i], top, view->now_unix);
+            ui_draw_post(&view->posts[i], i, top, view->now_unix);
         }
         sceGuScissor(0, 0, UI_SCR_W, UI_SCR_H);
         ui_draw_scrollbar();
