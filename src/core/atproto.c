@@ -34,6 +34,9 @@
 #define EMBED_IMAGES_VIEW  "app.bsky.embed.images#view"
 #define EMBED_RWM_VIEW     "app.bsky.embed.recordWithMedia#view"
 
+/* The only richtext feature that is rendered; mention/tag are ignored */
+#define FACET_LINK_FEATURE "app.bsky.richtext.facet#link"
+
 /* 802.11b at ~200KB/s needs headroom for a ~50KB thumbnail */
 #define ATP_IMAGE_TIMEOUT_SEC 15
 
@@ -200,6 +203,18 @@ static int json_pos_int(const cJSON *obj, const char *key)
         return 0;
     }
     return it->valueint;
+}
+
+/* -1 unless obj[key] is a number within [0, 65535] */
+static long json_byte_offset(const cJSON *obj, const char *key)
+{
+    const cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+
+    if (!cJSON_IsNumber(it) ||
+        it->valuedouble < 0.0 || it->valuedouble > 65535.0) {
+        return -1;
+    }
+    return (long)it->valuedouble;
 }
 
 /* ------------------------------------------------------------------ */
@@ -567,6 +582,91 @@ static void post_read_images(const cJSON *post, pspsky_post_t *p)
     }
 }
 
+/* 1 when the facet carries at least one link feature */
+static int facet_has_link(const cJSON *facet)
+{
+    const cJSON *features = cJSON_GetObjectItemCaseSensitive(facet, "features");
+    const cJSON *feature;
+
+    if (!cJSON_IsArray(features)) {
+        return 0;
+    }
+    cJSON_ArrayForEach(feature, features) {
+        const char *type = json_str(feature, "$type");
+
+        if (type != NULL && strcmp(type, FACET_LINK_FEATURE) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Sorts the collected ranges by start; stable, and n is at most 8 */
+static void sort_link_ranges(pspsky_post_t *p)
+{
+    int i;
+
+    for (i = 1; i < p->link_count; ++i) {
+        unsigned short s = p->link_start[i];
+        unsigned short e = p->link_end[i];
+        int j = i - 1;
+
+        while (j >= 0 && p->link_start[j] > s) {
+            p->link_start[j + 1] = p->link_start[j];
+            p->link_end[j + 1]   = p->link_end[j];
+            --j;
+        }
+        p->link_start[j + 1] = s;
+        p->link_end[j + 1]   = e;
+    }
+}
+
+/* Fills the link ranges from record.facets; runs after text is stored because
+   the offsets are clipped to the truncated copy */
+static void post_read_link_facets(const cJSON *record, pspsky_post_t *p)
+{
+    const cJSON *facets = cJSON_GetObjectItemCaseSensitive(record, "facets");
+    const cJSON *facet;
+    size_t len = strlen(p->text);
+
+    if (!cJSON_IsArray(facets)) {
+        return;
+    }
+
+    cJSON_ArrayForEach(facet, facets) {
+        const cJSON *index;
+        long start;
+        long end;
+
+        if (p->link_count >= PSPSKY_MAX_LINK_RANGES) {
+            break;                  /* the rest is dropped, not an error */
+        }
+        if (!facet_has_link(facet)) {
+            continue;               /* mention/tag only */
+        }
+        index = json_obj(facet, "index");
+        if (index == NULL) {
+            continue;
+        }
+        start = json_byte_offset(index, "byteStart");
+        end   = json_byte_offset(index, "byteEnd");
+        if (start < 0 || end < 0 || start >= end) {
+            continue;
+        }
+        if ((size_t)start >= len) {
+            continue;               /* entirely past the stored text */
+        }
+        if ((size_t)end > len) {
+            end = (long)len;        /* truncation cut the tail off */
+        }
+        p->link_start[p->link_count] = (unsigned short)start;
+        p->link_end[p->link_count]   = (unsigned short)end;
+        p->link_count++;
+    }
+
+    sort_link_ranges(p);
+}
+
 /* E_PARSE when handle or text is missing; the caller skips that element */
 static int post_from_feed_item(const cJSON *item, pspsky_post_t *p)
 {
@@ -614,6 +714,8 @@ static int post_from_feed_item(const cJSON *item, pspsky_post_t *p)
     copy_utf8_trunc(p->display_name, sizeof(p->display_name), display);
     copy_utf8_trunc(p->text,         sizeof(p->text),         text);
     copy_utf8_trunc(p->created_at,   sizeof(p->created_at),   created);
+
+    post_read_link_facets(record, p);
 
     /* Parse the raw string, not the truncated copy */
     p->created_at_unix = (created != NULL) ? pspsky_iso8601_parse(created) : -1;

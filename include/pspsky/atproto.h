@@ -16,6 +16,7 @@
 #define PSPSKY_MAX_POSTS       20    /* max posts per getTimeline call */
 #define PSPSKY_ERRMSG_MAX      160
 #define PSPSKY_MAX_THUMB_URL   256
+#define PSPSKY_MAX_LINK_RANGES 8
 
 #define PSPSKY_MAX_BLOB_CID    256
 #define PSPSKY_MAX_BLOB_MIME   64
@@ -40,6 +41,10 @@ typedef struct {
     int  img_count;                            /* images in the embed view; 0 = none */
     int  img_aspect_w;                         /* aspectRatio of the first image; 0 = unknown */
     int  img_aspect_h;
+    /* byte ranges into text (UTF-8) marking link facets; sorted by start */
+    unsigned short link_start[PSPSKY_MAX_LINK_RANGES];
+    unsigned short link_end[PSPSKY_MAX_LINK_RANGES];
+    int  link_count;
 } pspsky_post_t;
 
 /* ~36KB, keep off the stack */

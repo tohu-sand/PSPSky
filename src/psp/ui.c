@@ -64,6 +64,7 @@
 #define UI_COL_BAR      0xFF3A2A20
 #define UI_COL_TEXT     0xFFF0F0F0
 #define UI_COL_NAME     0xFFE8E8FF
+#define UI_COL_LINK     0xFFFFB058   /* link facet in the body (sky blue)    */
 #define UI_COL_DIM      0xFF9C9C9C
 #define UI_COL_SEP      0xFF4A3A30
 #define UI_COL_TRACK    0xFF3A2A20
@@ -379,12 +380,6 @@ static const char *ui_wrap_line(const char *text, int i)
     return ui_copy_line(text, s_wrap_start[i], s_wrap_len[i]);
 }
 
-/* Same, from the per-post cache rather than the shared wrap result. */
-static const char *ui_cached_line(const char *text, int idx, int i)
-{
-    return ui_copy_line(text, s_pw_start[idx][i], s_pw_len[idx][i]);
-}
-
 /* ------------------------------------------------------------------ */
 /* Head-first truncation                                               */
 /* ------------------------------------------------------------------ */
@@ -518,9 +513,7 @@ static int ui_post_extra_h(const pspsky_post_t *post,
     if (post->img_count >= 1) {
         return UI_LINE_H;     /* marker line instead of the thumbnail */
     }
-    if (post->has_embed) {
-        return UI_LINE_H;     /* embed of some other kind */
-    }
+    /* Link cards and quoted records get no marker of their own. */
     return 0;
 }
 
@@ -700,6 +693,73 @@ static int ui_max_scroll(void)
 /* Drawing a single post                                               */
 /* ------------------------------------------------------------------ */
 
+/* Steps back to the start of the code point covering off, but not past lo. */
+static int ui_cp_floor(const char *text, int off, int lo)
+{
+    while (off > lo && ((unsigned char)text[off] & 0xC0) == 0x80) {
+        off--;
+    }
+    return off;
+}
+
+/* Draws text[start .. start+len) and returns the pen x after it. */
+static float ui_body_seg(const char *text, int start, int len,
+                         unsigned int color, float x, float y)
+{
+    char seg[PSPSKY_MAX_TEXT];
+
+    if (len <= 0) {
+        return x;
+    }
+    if (len > (int)sizeof(seg) - 1) {
+        len = (int)sizeof(seg) - 1;
+    }
+    memcpy(seg, text + start, (size_t)len);
+    seg[len] = '\0';
+    return ui_text(UI_SIZE_BODY, color, x, y, seg);
+}
+
+/* Draws one wrapped body line, tinting the parts covered by a link facet.
+   Purely a colour split: the same bytes are printed in the same order, so the
+   pen ends where a single print of the whole line would have left it. */
+static void ui_draw_body_line(const pspsky_post_t *post, int start, int len,
+                              float x, float y)
+{
+    int end = start + len;
+    int pos = start;
+    int k;
+
+    for (k = 0; k < post->link_count && k < PSPSKY_MAX_LINK_RANGES; k++) {
+        int ls = (int)post->link_start[k];
+        int le = (int)post->link_end[k];
+
+        if (le <= pos) {
+            continue;   /* ends before this line, or already covered */
+        }
+        if (ls >= end) {
+            break;      /* starts are sorted, so the rest are further on */
+        }
+        if (ls < pos) {
+            ls = pos;   /* overlapping ranges clamp to the previous segment */
+        }
+        if (le > end) {
+            le = end;
+        }
+        /* Ranges are raw byte offsets, so a split can land inside a multi-byte
+           character; back both ends up to a boundary rather than hand
+           intraFont a truncated sequence. */
+        ls = ui_cp_floor(post->text, ls, pos);
+        le = ui_cp_floor(post->text, le, ls);
+        if (le <= ls) {
+            continue;
+        }
+        x   = ui_body_seg(post->text, pos, ls - pos, UI_COL_TEXT, x, y);
+        x   = ui_body_seg(post->text, ls, le - ls, UI_COL_LINK, x, y);
+        pos = le;
+    }
+    ui_body_seg(post->text, pos, end - pos, UI_COL_TEXT, x, y);
+}
+
 /* idx indexes the layout cache built by ui_layout_post(); it must be < the
    s_layout_count that the current s_layout_valid covers. */
 static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
@@ -752,15 +812,14 @@ static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
         if (ly + UI_LINE_H < UI_LIST_TOP || ly > UI_LIST_BOTTOM) {
             continue;   /* skip lines that are off screen */
         }
-        ui_text(UI_SIZE_BODY, UI_COL_TEXT,
-                (float)UI_MARGIN_X, (float)(ly + UI_BASELINE),
-                ui_cached_line(post->text, idx, i));
+        ui_draw_body_line(post, s_pw_start[idx][i], s_pw_len[idx][i],
+                          (float)UI_MARGIN_X, (float)(ly + UI_BASELINE));
     }
 
     h     = UI_LINE_H + UI_TIME_LINE_H + lines * UI_LINE_H + UI_POST_PAD;
     below = body_top + lines * UI_LINE_H;
 
-    /* Same three cases as ui_post_extra_h(), which supplies the height. */
+    /* Same two cases as ui_post_extra_h(), which supplies the height. */
     if (img != NULL) {
         int iy = below + UI_TL_IMG_GAP;
 
@@ -781,13 +840,6 @@ static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
             ui_text(UI_SIZE_NAME, UI_COL_DIM,
                     (float)UI_MARGIN_X, (float)(below + UI_BASELINE),
                     ui_img_mark(post, markbuf, sizeof markbuf));
-        }
-    } else if (post->has_embed) {
-        /* Presence only; the embed contents are never inspected. */
-        if (below + UI_LINE_H >= UI_LIST_TOP && below <= UI_LIST_BOTTOM) {
-            ui_text(UI_SIZE_NAME, UI_COL_DIM,
-                    (float)UI_MARGIN_X, (float)(below + UI_BASELINE),
-                    UI_EMBED_MARK);
         }
     }
     h += ui_post_extra_h(post, img);
