@@ -57,6 +57,7 @@ int pspsky_osk_input(const char *desc_utf8, const char *initial_utf8,
     }
 
     memset(&data, 0, sizeof(data));
+    data.unk_00        = 1;               /* enables Japanese kanji conversion */
     data.language      = (pspsky_lang_get() == PSPSKY_LANG_JA)
                              ? PSP_UTILITY_OSK_LANGUAGE_JAPANESE
                              : PSP_UTILITY_OSK_LANGUAGE_ENGLISH;

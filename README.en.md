@@ -103,6 +103,18 @@ The PSP has no secure key storage, and a key placed anywhere the EBOOT can read 
 | X | Cancel (on the image preview screen: choose a different file) |
 | START | Quit |
 
+### Japanese input on the on-screen keyboard
+
+| Button | Action |
+|---|---|
+| SELECT | Switch character set (hiragana / katakana / alphanumeric / symbols) |
+| Triangle | Convert (while hiragana are entered) / space (when empty) |
+| Up / Down | Pick a conversion candidate |
+| O | Accept the candidate |
+| START | Finish input and go to the confirmation screen |
+
+Type hiragana, then press Triangle to bring up the kanji candidates. Choose one with Up / Down and accept it with O.
+
 ### Images in the timeline
 
 Posts that contain an image show the first one as a thumbnail below the post text, with the aspect ratio preserved. When a post has two or more images, an `[images x3]` count (`[画像 x3]` in the Japanese UI) appears under the thumbnail.
