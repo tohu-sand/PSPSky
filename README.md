@@ -6,6 +6,9 @@ PSP(PlayStation Portable) 単体で動作する [Bluesky](https://bsky.app) ク�
 
 PSP から `bsky.social` へ **直接 TLS 1.2 接続**(libcurl + mbedTLS、CA 検証あり)してタイムラインの閲覧と投稿を行います。
 
+![PSPSky のタイムライン画面](assets/screenshot-timeline.png)
+
+
 ---
 
 ## 特徴

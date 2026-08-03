@@ -6,6 +6,8 @@ A [Bluesky](https://bsky.app) client homebrew that runs entirely on the PSP (Pla
 
 The PSP connects **directly to `bsky.social` over TLS 1.2** (libcurl + mbedTLS, with CA verification) to read the timeline and post.
 
+![The PSPSky timeline screen](assets/screenshot-timeline.png)
+
 ---
 
 ## Features
