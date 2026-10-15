@@ -1,7 +1,4 @@
-/*
- * PSPSky - pspsky_transport_t over libcurl (mbedTLS). One easy handle is
- * reused across requests; a PSP TLS handshake costs seconds. Never proxied.
- */
+/* Reuse the curl handle to avoid repeated TLS handshakes on the PSP. */
 
 #include <ctype.h>
 #include <stdio.h>
@@ -28,21 +25,18 @@
 typedef struct {
     CURL *easy;
     char  cacert[CACERT_PATH_MAX];
-    /* CURLOPT_ERRORBUFFER; curl writes only on failure, so clear before each
-       perform. */
+    /* CURLOPT_ERRORBUFFER; valid for the lifetime of the handle. */
     char  errbuf[CURL_ERROR_SIZE];
 } curl_ctx_t;
 
 static curl_ctx_t g_ctx;
 static int        g_global_inited = 0;
 
-/* ------------------------------------------------------ response body buffer */
-
 typedef struct {
     char  *data;
-    size_t len;      /* byte length excluding the NUL              */
-    size_t cap;      /* bytes allocated, NUL included              */
-    int    overflow; /* 1 = over limit or alloc failed -> E_NOMEM  */
+    size_t len;      /* Excludes the NUL terminator. */
+    size_t cap;      /* Includes the NUL terminator. */
+    int    overflow; /* Limit or allocation failure; maps to E_NOMEM. */
 } wbuf_t;
 
 static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
@@ -52,7 +46,7 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
     size_t  need;
 
     if (b->overflow) {
-        return 0; /* abort the transfer */
+        return 0;
     }
     if (n == 0) {
         return 0;
@@ -62,13 +56,13 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
         return 0;
     }
 
-    need = b->len + n + 1; /* room for the NUL terminator */
+    need = b->len + n + 1;
     if (need > b->cap) {
         size_t ncap = (b->cap != 0) ? b->cap : (size_t)WBUF_INITIAL;
         char  *np;
 
         while (ncap < need) {
-            ncap *= 2; /* grow by doubling */
+            ncap *= 2;
         }
         if (ncap > (size_t)PSPSKY_HTTP_BODY_MAX + 1) {
             ncap = (size_t)PSPSKY_HTTP_BODY_MAX + 1;
@@ -88,12 +82,7 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
     return n;
 }
 
-/* ---------------------------------------------------- error classification */
-
-/* Policy: TLS/certificate failures map to E_TLS, everything else to
-   E_TRANSPORT; the split only chooses the message shown to the user.
-   CURLE_SSL_CACERT is an alias of CURLE_PEER_FAILED_VERIFICATION since libcurl
-   7.62, so the two can never both appear as switch cases. */
+/* CURLE_SSL_CACERT aliases CURLE_PEER_FAILED_VERIFICATION in newer curl. */
 static int is_tls_error(CURLcode rc)
 {
     return (rc == CURLE_PEER_FAILED_VERIFICATION ||
@@ -128,14 +117,12 @@ static int utf8_fit_bytes(const char *s, int max)
     if (n <= max) {
         return n;
     }
-    /* Back out of a continuation byte (10xxxxxx). */
     while (max > 0 && ((unsigned char)s[max] & 0xC0) == 0x80) {
         max--;
     }
     return max;
 }
 
-/* Pull the "-0x2900" style code out of errbuf; 1 if one was found. */
 static int extract_mbedtls_code(const char *errbuf, char *out, size_t outsz)
 {
     const char *p;
@@ -152,7 +139,6 @@ static int extract_mbedtls_code(const char *errbuf, char *out, size_t outsz)
     if (p == NULL) {
         return 0;
     }
-    /* First 3 characters are "-0x"; after that, hex digits only. */
     for (i = 0; i < 8 && i + 1 < outsz && p[i] != '\0'; i++) {
         if (i >= 3 && !isxdigit((unsigned char)p[i])) {
             break;
@@ -161,13 +147,12 @@ static int extract_mbedtls_code(const char *errbuf, char *out, size_t outsz)
     }
     out[i] = '\0';
     if (i <= 3) {
-        out[0] = '\0';   /* "-0x" with no digits: unusable */
+        out[0] = '\0';
         return 0;
     }
     return 1;
 }
 
-/* Pull a BADCERT_* token out of errbuf; 1 if one was found. */
 static int extract_badcert_token(const char *errbuf, char *out, size_t outsz)
 {
     const char *p;
@@ -214,7 +199,6 @@ static int errmsg_append(char *dst, size_t dstsz, const char *add)
     return 1;
 }
 
-/* Splits the TLS message three ways; the caller still returns E_TLS. */
 static void fill_tls_errmsg(CURLcode rc, const curl_ctx_t *c,
                             pspsky_http_resp_t *resp)
 {
@@ -222,7 +206,6 @@ static void fill_tls_errmsg(CURLcode rc, const curl_ctx_t *c,
     char code[MBEDTLS_CODE_MAX];
     char sfx[MBEDTLS_CODE_MAX + 16];
 
-    /* Kept as " mbedTLS:-0x2900" when available. */
     sfx[0] = '\0';
     if (extract_mbedtls_code(eb, code, sizeof code)) {
         snprintf(sfx, sizeof sfx, " mbedTLS:%s", code);
@@ -245,9 +228,7 @@ static void fill_tls_errmsg(CURLcode rc, const curl_ctx_t *c,
         snprintf(resp->errmsg, sizeof resp->errmsg, "%s%.*s%s%s",
                  pre, utf8_fit_bytes(path, room), path, post, sfx);
     } else if (rc == CURLE_PEER_FAILED_VERIFICATION || rc == CURLE_SSL_CACERT) {
-        /* The rejecting BADCERT flag and the clock time() saw, appended while
-           they fit: together they show whether a wrong clock is to blame.
-           e.g. "Cert verification failed (curl:60) BADCERT_EXPIRED t=1785067200" */
+        /* Include the certificate flag and clock value to diagnose date failures. */
         char tok[BADCERT_TOKEN_MAX];
         char frag[BADCERT_TOKEN_MAX + 8];
 
@@ -263,13 +244,11 @@ static void fill_tls_errmsg(CURLcode rc, const curl_ctx_t *c,
 
         errmsg_append(resp->errmsg, sizeof resp->errmsg, sfx);
     } else {
-        /* Remaining is_tls_error() case: CURLE_SSL_CONNECT_ERROR. */
         snprintf(resp->errmsg, sizeof resp->errmsg,
                  pspsky_tr(PSPSKY_STR_TRC_TLS_HANDSHAKE), sfx);
     }
 }
 
-/* Maps a failed rc onto the interface error codes and fills resp->errmsg. */
 static int classify_curl_error(CURLcode rc, const curl_ctx_t *c,
                                pspsky_http_resp_t *resp)
 {
@@ -286,8 +265,6 @@ static int classify_curl_error(CURLcode rc, const curl_ctx_t *c,
              pspsky_tr(PSPSKY_STR_TRC_COMM_FAIL), (int)rc);
     return PSPSKY_E_TRANSPORT;
 }
-
-/* ---------------------------------------------------------------- perform */
 
 static int curl_transport_perform(void *ctx,
                                   const pspsky_http_req_t *req,
@@ -317,7 +294,6 @@ static int curl_transport_perform(void *ctx,
                  pspsky_tr(PSPSKY_STR_ERR_ARG));
         return PSPSKY_E_ARG;
     }
-    /* body (JSON) and body_bin (raw) are exclusive; body_bin is POST only. */
     if (req->body != NULL && req->body_bin != NULL) {
         snprintf(resp->errmsg, sizeof resp->errmsg, "%s",
                  pspsky_tr(PSPSKY_STR_ERR_ARG));
@@ -338,7 +314,6 @@ static int curl_transport_perform(void *ctx,
 
     memset(&buf, 0, sizeof buf);
 
-    /* --- headers --- */
     hdrs = curl_slist_append(NULL, "Accept: application/json");
     if (hdrs == NULL) {
         goto nomem;
@@ -375,7 +350,6 @@ static int curl_transport_perform(void *ctx,
         hdrs = tmp;
     }
 
-    /* --- method and body --- */
     if (strcmp(req->method, "POST") == 0) {
         curl_easy_setopt(easy, CURLOPT_POST, 1L);
         if (req->body_bin != NULL) {
@@ -394,21 +368,20 @@ static int curl_transport_perform(void *ctx,
         curl_easy_setopt(easy, CURLOPT_HTTPGET, 1L);
     }
 
-    /* --- options re-applied on every request --- */
     curl_easy_setopt(easy, CURLOPT_URL, req->url);
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, hdrs);
     if (c->cacert[0] != '\0') {
         curl_easy_setopt(easy, CURLOPT_CAINFO, c->cacert);
     }
-    /* The SDK's libcurl has the build machine's /etc/ssl/certs baked in as the
-       default CA path, which CAINFO does not override. Probing that missing
-       directory fails the request with curl:77, so it must be cleared. */
+    /*
+     * CAINFO does not override the SDK's host CA directory. Clear that path
+     * to prevent curl:77 on the PSP.
+     */
     curl_easy_setopt(easy, CURLOPT_CAPATH, NULL);
     curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 30L);
-    /* ~2MB over 802.11b can exceed 60 s, so only uploads get 180 s. A caller
-       that states its own budget (thumbnails) overrides both. */
+    /* Allow longer uploads over 802.11b unless the caller supplies a timeout. */
     curl_easy_setopt(easy, CURLOPT_TIMEOUT,
                      (req->timeout_sec > 0)
                          ? (long)req->timeout_sec
@@ -455,7 +428,7 @@ static int curl_transport_perform(void *ctx,
     curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &code);
 
     if (buf.data == NULL) {
-        /* Empty string so the caller can free() even with no body. */
+        /* Successful responses always return an allocated, NUL-terminated body. */
         buf.data = (char *)malloc(1);
         if (buf.data == NULL) {
             snprintf(resp->errmsg, sizeof resp->errmsg, "%s",
@@ -491,8 +464,6 @@ fail:
     return ret;
 }
 
-/* ------------------------------------------------------------ init / term */
-
 int pspsky_curl_transport_init(pspsky_transport_t *out, const char *cacert_path)
 {
     if (out == NULL) {
@@ -524,7 +495,6 @@ int pspsky_curl_transport_init(pspsky_transport_t *out, const char *cacert_path)
         snprintf(g_ctx.cacert, sizeof g_ctx.cacert, "%s", cacert_path);
     }
 
-    /* g_ctx is static, so setting this once is enough. */
     g_ctx.errbuf[0] = '\0';
     curl_easy_setopt(g_ctx.easy, CURLOPT_ERRORBUFFER, g_ctx.errbuf);
 

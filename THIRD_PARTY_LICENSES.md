@@ -9,6 +9,7 @@ license texts and required notices.
 ### MIT
 
 - cJSON@1.7.18 (bundled, `vendor/cjson/`) — Copyright (c) 2009-2017 Dave Gamble and cJSON contributors
+- Bluesky Social app (https://github.com/bluesky-social/social-app) — the vector paths of the butterfly logo, the default avatar and the repost and reply icons, rasterized into `src/psp/ui_atlas.h` by `tools/gen_ui_atlas.py` — Copyright 2023–2026 Bluesky Social PBC
 
 ### curl
 

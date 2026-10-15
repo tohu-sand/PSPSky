@@ -1,21 +1,17 @@
-/* UI string tables (ja/en) and the language state.
- *
- * The en column must stay pure ASCII (0x20..0x7E and \n) so every character
- * still renders under the ltn0.pgf fallback font on non-Japanese PSPs.
+/*
+ * English strings must use ASCII (0x20..0x7E and \n)
+ * for the ltn0.pgf fallback font on non-Japanese PSPs.
  */
 
-#include <stddef.h>   /* NULL */
+#include <stddef.h>
 
 #include "pspsky/strings.h"
 
-/* Not thread-safe; PSPSky is single-threaded */
 static pspsky_lang_t s_lang = PSPSKY_LANG_JA;
 
-/* Fallback for out-of-range ids and entries the tables left NULL */
 static const char k_unknown[] = "???";
 
 static const char *const k_ja[PSPSKY_STR_COUNT] = {
-    /* --- A. error.c: pspsky_strerror messages --- */
     [PSPSKY_STR_ERR_OK] =
         "成功",
     [PSPSKY_STR_ERR_ARG] =
@@ -46,39 +42,69 @@ static const char *const k_ja[PSPSKY_STR_COUNT] = {
         "リクエストが多すぎます。しばらく待ってから再試行してください",
     [PSPSKY_STR_ERR_UNKNOWN] =
         "不明なエラー",
-    /* --- B. timeutil.c: relative time --- */
+
     [PSPSKY_STR_TIME_JUST_NOW] =
-        "たった今",
+        "今",
+    [PSPSKY_STR_TIME_SEC_AGO] =
+        "%d秒",
     [PSPSKY_STR_TIME_MIN_AGO] =
-        "%d分前",
+        "%d分",
     [PSPSKY_STR_TIME_HOUR_AGO] =
-        "%d時間前",
+        "%d時間",
     [PSPSKY_STR_TIME_DAY_AGO] =
-        "%d日前",
-    /* --- C. net.c: connection progress --- */
+        "%d日",
+    [PSPSKY_STR_TIME_MONTH_AGO] =
+        "%dヶ月",
+
     [PSPSKY_STR_NET_CONNECTING_AP] =
         "アクセスポイントに接続中...",
     [PSPSKY_STR_NET_GETTING_IP] =
         "IPアドレスを取得中...",
     [PSPSKY_STR_NET_CONNECTED] =
         "接続しました",
-    /* --- D. ui.c --- */
-    [PSPSKY_STR_UI_FOOTER_TIMELINE] =
-        "↑↓:スクロール L:更新 R:さらに読む △:投稿 START:終了",
-    [PSPSKY_STR_UI_FOOTER_PICK] =
-        "↑↓:選択 ○:決定 ×:キャンセル",
-    [PSPSKY_STR_UI_FOOTER_PREV] =
-        "○:この画像で投稿 ×:選び直す",
-    [PSPSKY_STR_UI_HINT_COMPOSE] =
-        "○:投稿 □:画像を付けて投稿 ×:キャンセル",
-    [PSPSKY_STR_UI_HINT_OK] =
-        "○:OK",
-    [PSPSKY_STR_UI_HINT_YES_NO] =
-        "○:はい ×:いいえ",
+
+    [PSPSKY_STR_UI_KEY_REFRESH] =
+        "更新",
+    [PSPSKY_STR_UI_KEY_MORE] =
+        "さらに読み込む",
+    [PSPSKY_STR_UI_KEY_POST] =
+        "投稿",
+    [PSPSKY_STR_UI_KEY_QUIT] =
+        "終了",
+    [PSPSKY_STR_UI_KEY_OK] =
+        "OK",
+    [PSPSKY_STR_UI_KEY_YES] =
+        "はい",
+    [PSPSKY_STR_UI_KEY_NO] =
+        "いいえ",
+    [PSPSKY_STR_UI_KEY_POST_IMAGE] =
+        "画像を付けて投稿",
+    [PSPSKY_STR_UI_KEY_CANCEL] =
+        "キャンセル",
+    [PSPSKY_STR_UI_KEY_SELECT] =
+        "決定",
+    [PSPSKY_STR_UI_KEY_POST_THIS] =
+        "この画像で投稿",
+    [PSPSKY_STR_UI_KEY_RECHOOSE] =
+        "選び直す",
+    [PSPSKY_STR_UI_TAB_FOLLOWING] =
+        "フォロー中",
+    [PSPSKY_STR_UI_REPOSTED_BY] =
+        "%sがリポスト",
+    [PSPSKY_STR_UI_REPOSTED_BY_YOU] =
+        "あなたのリポスト",
+    [PSPSKY_STR_UI_REPLIED_TO] =
+        "%sへの返信",
+    [PSPSKY_STR_UI_REPLIED_TO_YOU] =
+        "あなたへの返信",
+    [PSPSKY_STR_UI_REPLIED_TO_POST] =
+        "投稿への返信",
+    [PSPSKY_STR_UI_REPLIED_TO_BLOCKED] =
+        "ブロックされた投稿への返信",
     [PSPSKY_STR_UI_EMBED_MARK] =
-        "[画像]",
+        "画像",
     [PSPSKY_STR_UI_IMG_MARK_N] =
-        "[画像 x%d]",
+        "画像 %d枚",
     [PSPSKY_STR_UI_PREV_TITLE] =
         "画像プレビュー",
     [PSPSKY_STR_UI_PREV_NO_IMAGE] =
@@ -95,7 +121,7 @@ static const char *const k_ja[PSPSKY_STR_COUNT] = {
         "パスが長すぎます",
     [PSPSKY_STR_UI_MSG_DIR_OPEN_FAIL] =
         "フォルダを開けません",
-    /* --- E. main.c --- */
+
     [PSPSKY_STR_CACERT_NOT_FOUND] =
         "cacert.pem が見つかりません",
     [PSPSKY_STR_CACERT_UNREADABLE] =
@@ -158,7 +184,7 @@ static const char *const k_ja[PSPSKY_STR_COUNT] = {
         "セッションの有効期限が切れました。\n再ログインします",
     [PSPSKY_STR_CONFIRM_ABORT_QUIT] =
         "入力を中止しました。終了しますか？",
-    /* --- F. transport_curl.c: errmsg --- */
+
     [PSPSKY_STR_TRC_CACERT_READ_PRE] =
         "cacert.pem を読み込めません: ",
     [PSPSKY_STR_TRC_PATH_UNSET] =
@@ -176,7 +202,6 @@ static const char *const k_ja[PSPSKY_STR_COUNT] = {
 };
 
 static const char *const k_en[PSPSKY_STR_COUNT] = {
-    /* --- A. error.c: pspsky_strerror messages --- */
     [PSPSKY_STR_ERR_OK] =
         "Success",
     [PSPSKY_STR_ERR_ARG] =
@@ -207,39 +232,69 @@ static const char *const k_en[PSPSKY_STR_COUNT] = {
         "Too many requests. Please wait and try again",
     [PSPSKY_STR_ERR_UNKNOWN] =
         "Unknown error",
-    /* --- B. timeutil.c: relative time --- */
+
     [PSPSKY_STR_TIME_JUST_NOW] =
-        "just now",
+        "now",
+    [PSPSKY_STR_TIME_SEC_AGO] =
+        "%ds",
     [PSPSKY_STR_TIME_MIN_AGO] =
-        "%dm ago",
+        "%dm",
     [PSPSKY_STR_TIME_HOUR_AGO] =
-        "%dh ago",
+        "%dh",
     [PSPSKY_STR_TIME_DAY_AGO] =
-        "%dd ago",
-    /* --- C. net.c: connection progress --- */
+        "%dd",
+    [PSPSKY_STR_TIME_MONTH_AGO] =
+        "%dmo",
+
     [PSPSKY_STR_NET_CONNECTING_AP] =
         "Connecting to access point...",
     [PSPSKY_STR_NET_GETTING_IP] =
         "Getting IP address...",
     [PSPSKY_STR_NET_CONNECTED] =
         "Connected",
-    /* --- D. ui.c --- */
-    [PSPSKY_STR_UI_FOOTER_TIMELINE] =
-        "UP/DOWN:Scroll L:Refresh R:More TRIANGLE:Post START:Quit",
-    [PSPSKY_STR_UI_FOOTER_PICK] =
-        "UP/DOWN:Select O:Enter X:Cancel",
-    [PSPSKY_STR_UI_FOOTER_PREV] =
-        "O:Post this image X:Choose again",
-    [PSPSKY_STR_UI_HINT_COMPOSE] =
-        "O:Post SQUARE:Post with image X:Cancel",
-    [PSPSKY_STR_UI_HINT_OK] =
-        "O:OK",
-    [PSPSKY_STR_UI_HINT_YES_NO] =
-        "O:Yes X:No",
+
+    [PSPSKY_STR_UI_KEY_REFRESH] =
+        "Refresh",
+    [PSPSKY_STR_UI_KEY_MORE] =
+        "Load more",
+    [PSPSKY_STR_UI_KEY_POST] =
+        "Post",
+    [PSPSKY_STR_UI_KEY_QUIT] =
+        "Quit",
+    [PSPSKY_STR_UI_KEY_OK] =
+        "OK",
+    [PSPSKY_STR_UI_KEY_YES] =
+        "Yes",
+    [PSPSKY_STR_UI_KEY_NO] =
+        "No",
+    [PSPSKY_STR_UI_KEY_POST_IMAGE] =
+        "Post with image",
+    [PSPSKY_STR_UI_KEY_CANCEL] =
+        "Cancel",
+    [PSPSKY_STR_UI_KEY_SELECT] =
+        "Select",
+    [PSPSKY_STR_UI_KEY_POST_THIS] =
+        "Post this image",
+    [PSPSKY_STR_UI_KEY_RECHOOSE] =
+        "Choose again",
+    [PSPSKY_STR_UI_TAB_FOLLOWING] =
+        "Following",
+    [PSPSKY_STR_UI_REPOSTED_BY] =
+        "Reposted by %s",
+    [PSPSKY_STR_UI_REPOSTED_BY_YOU] =
+        "Reposted by you",
+    [PSPSKY_STR_UI_REPLIED_TO] =
+        "Replied to %s",
+    [PSPSKY_STR_UI_REPLIED_TO_YOU] =
+        "Replied to you",
+    [PSPSKY_STR_UI_REPLIED_TO_POST] =
+        "Replied to a post",
+    [PSPSKY_STR_UI_REPLIED_TO_BLOCKED] =
+        "Replied to a blocked post",
     [PSPSKY_STR_UI_EMBED_MARK] =
-        "[image]",
+        "Image",
     [PSPSKY_STR_UI_IMG_MARK_N] =
-        "[images x%d]",
+        "%d images",
     [PSPSKY_STR_UI_PREV_TITLE] =
         "Image preview",
     [PSPSKY_STR_UI_PREV_NO_IMAGE] =
@@ -256,7 +311,7 @@ static const char *const k_en[PSPSKY_STR_COUNT] = {
         "Path is too long",
     [PSPSKY_STR_UI_MSG_DIR_OPEN_FAIL] =
         "Cannot open folder",
-    /* --- E. main.c --- */
+
     [PSPSKY_STR_CACERT_NOT_FOUND] =
         "cacert.pem not found",
     [PSPSKY_STR_CACERT_UNREADABLE] =
@@ -319,7 +374,7 @@ static const char *const k_en[PSPSKY_STR_COUNT] = {
         "Session expired.\nLogging in again",
     [PSPSKY_STR_CONFIRM_ABORT_QUIT] =
         "Input cancelled. Quit PSPSky?",
-    /* --- F. transport_curl.c: errmsg --- */
+
     [PSPSKY_STR_TRC_CACERT_READ_PRE] =
         "Cannot read cacert.pem: ",
     [PSPSKY_STR_TRC_PATH_UNSET] =

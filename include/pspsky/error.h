@@ -1,10 +1,10 @@
-/* Error codes shared by every module. */
 #ifndef PSPSKY_ERROR_H
 #define PSPSKY_ERROR_H
 
-/* Grouped by cause so callers need not parse messages: E_AUTH_EXPIRED is
-   retryable after a refresh, E_AUTH is not, and E_HTTP is the catch-all for
-   non-2xx statuses with no more specific code. */
+/*
+ * Only E_AUTH_EXPIRED permits a session refresh.
+ * E_HTTP covers non-2xx responses without a more specific error.
+ */
 enum {
     PSPSKY_OK             =   0,
     PSPSKY_E_ARG          =  -1,
@@ -19,7 +19,7 @@ enum {
     PSPSKY_E_NET_INIT     = -10,
     PSPSKY_E_NET_CONNECT  = -11,  /* APCTL connect failure or timeout */
     PSPSKY_E_CANCELLED    = -12,
-    PSPSKY_E_RATELIMIT    = -13   /* HTTP 429 */
+    PSPSKY_E_RATELIMIT    = -13  /* HTTP 429 */
 };
 
 /* Static UTF-8 string in the current UI language; do not free */

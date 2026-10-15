@@ -1,7 +1,6 @@
 /*
- * PSPSky - PSP on-screen keyboard wrapper, UTF-8 <-> UCS-2 at the boundary.
- * The OSK is UCS-2 only: non-BMP text cannot round-trip, and every length here
- * is a character count, not a byte count (up to 3 UTF-8 bytes each).
+ * The UCS-2 OSK cannot round-trip non-BMP text. Lengths are in characters,
+ * with up to 3 UTF-8 bytes per character.
  */
 
 #include <stdio.h>
@@ -21,10 +20,9 @@
 #define OSK_LIST_WORDS 4096   /* 16KB: the OSK frame only clears the screen */
 #define OSK_BG_COLOR   0xFF201510
 
-/* GU display list used while the OSK is up (separate from ui.c). */
 static unsigned int __attribute__((aligned(16))) s_osk_list[OSK_LIST_WORDS];
 
-/* Static so they stay off the stack. */
+/* Keep text buffers off the PSP stack. */
 static unsigned short s_desc[PSPSKY_OSK_MAX_CHARS + 1];
 static unsigned short s_intext[PSPSKY_OSK_MAX_CHARS + 1];
 static unsigned short s_outtext[PSPSKY_OSK_MAX_CHARS + 1];
@@ -67,7 +65,7 @@ int pspsky_osk_input(const char *desc_utf8, const char *initial_utf8,
     data.desc          = s_desc;
     data.intext        = s_intext;
     data.outtextlength = max_chars + 1;   /* outtext elements, NUL included */
-    data.outtextlimit  = max_chars;       /* max characters enterable       */
+    data.outtextlimit  = max_chars;
     data.outtext       = s_outtext;
 
     memset(&params, 0, sizeof(params));

@@ -1,9 +1,6 @@
 #!/bin/sh
-# Generates assets/cacert.pem: only the roots needed to verify bsky.social,
-# because the full bundle (~180KB) wastes PSP memory and load time. The result
-# is committed, since the PSP has no way to fetch it.
-#
-# Usage:  sh tools/make_cacert.sh
+# Generate a small CA bundle to limit PSP memory use and loading time.
+# Usage: sh tools/make_cacert.sh
 set -eu
 
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -11,8 +8,7 @@ OUT="$REPO_ROOT/assets/cacert.pem"
 SRC_URL="https://curl.se/ca/cacert.pem"
 SYSTEM_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
 
-# Roots to extract, one per line, matched exactly: the Amazon Trust chain
-# bsky.social uses today, its Starfield cross-signer, and ISRG X1 as a hedge.
+# Certificate subject names, matched exactly.
 WANTED='Amazon Root CA 1
 Amazon Root CA 2
 Amazon Root CA 3
@@ -23,7 +19,6 @@ ISRG Root X1'
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
-# --- fetch the input bundle ----------------------------------------------
 BUNDLE="$WORK/bundle.pem"
 MODE=""
 if command -v curl >/dev/null 2>&1 &&
@@ -40,8 +35,6 @@ else
 fi
 
 command -v openssl >/dev/null 2>&1 || { echo "error: openssl not found" >&2; exit 1; }
-
-# --- extraction helpers --------------------------------------------------
 
 # The curl bundle labels each certificate, so cut from the label to END.
 extract_by_label() {
@@ -82,7 +75,6 @@ if [ "$MODE" = "system" ]; then
     split_bundle "$SPLIT" "$BUNDLE"
 fi
 
-# --- generate -------------------------------------------------------------
 TMP_OUT="$WORK/cacert.pem"
 {
     echo "# PSPSky minimal CA bundle"
@@ -116,7 +108,6 @@ echo "$WANTED" | while IFS= read -r name; do
 done || missing=1
 [ "$missing" -eq 0 ] || exit 1
 
-# --- verify ---------------------------------------------------------------
 want_count=$(echo "$WANTED" | grep -c .)
 got_count=$(grep -c '^-----BEGIN CERTIFICATE-----$' "$TMP_OUT" || true)
 if [ "$got_count" -ne "$want_count" ]; then

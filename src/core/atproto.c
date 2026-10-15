@@ -1,9 +1,6 @@
-/* AT Protocol (XRPC) client. Portable C99 over libc and vendor/cjson.
- *
- * Engagement counts and viewer state are deliberately never read or stored;
- * only handle, displayName, text, createdAt and the cursor are parsed.
- */
+/* Engagement counts and viewer state must not be read or stored. */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,10 +14,6 @@
 #include "pspsky/transport.h"
 #include "pspsky/utf8.h"
 
-/* ------------------------------------------------------------------ */
-/* Endpoints                                                           */
-/* ------------------------------------------------------------------ */
-
 #define EP_CREATE_SESSION  PSPSKY_HOST_URL "/xrpc/com.atproto.server.createSession"
 #define EP_REFRESH_SESSION PSPSKY_HOST_URL "/xrpc/com.atproto.server.refreshSession"
 #define EP_GET_TIMELINE    PSPSKY_HOST_URL "/xrpc/app.bsky.feed.getTimeline"
@@ -30,18 +23,23 @@
 #define POST_COLLECTION    "app.bsky.feed.post"
 #define EMBED_IMAGES_TYPE  "app.bsky.embed.images"
 
-/* View-side ($type) counterparts, as returned by getTimeline */
 #define EMBED_IMAGES_VIEW  "app.bsky.embed.images#view"
 #define EMBED_RWM_VIEW     "app.bsky.embed.recordWithMedia#view"
 
-/* The only richtext feature that is rendered; mention/tag are ignored */
+/* Only link facets are rendered. */
 #define FACET_LINK_FEATURE "app.bsky.richtext.facet#link"
 
-/* 802.11b at ~200KB/s needs headroom for a ~50KB thumbnail */
+#define REASON_REPOST      "app.bsky.feed.defs#reasonRepost"
+#define PARENT_BLOCKED     "app.bsky.feed.defs#blockedPost"
+
+/* Use the 128px avatar preset to reduce transfer size. */
+#define AVATAR_PRESET       "/img/avatar/"
+#define AVATAR_THUMB_PRESET "/img/avatar_thumbnail/"
+
+/* Allow for slow 802.11b transfers. */
 #define ATP_IMAGE_TIMEOUT_SEC 15
 
-/* "via" is not in the app.bsky.feed.post lexicon, but records tolerate extra
-   top-level fields and clients render it by convention as "via PSPSky". */
+/* Nonstandard record field used by clients to display "via PSPSky". */
 #define PSPSKY_VIA_NAME    "PSPSky"
 
 /* %XX encoding can grow the cursor up to 3x in the worst case */
@@ -49,11 +47,6 @@
 /* "?limit=NN&cursor=" + the encoded cursor + slack */
 #define URL_CAP        (sizeof(EP_GET_TIMELINE) + 32 + ENC_CURSOR_CAP)
 
-/* ------------------------------------------------------------------ */
-/* String utilities                                                    */
-/* ------------------------------------------------------------------ */
-
-/* Drops the incomplete multi-byte sequence a raw byte-level cut leaves behind */
 static void trim_partial_utf8(char *s)
 {
     size_t len = strlen(s);
@@ -64,7 +57,7 @@ static void trim_partial_utf8(char *s)
         size_t need;
 
         if ((c & 0xC0) == 0x80) {
-            continue;               /* continuation byte; keep walking back */
+            continue;
         }
         if (c < 0x80)                need = 1;
         else if ((c & 0xE0) == 0xC0) need = 2;
@@ -73,13 +66,12 @@ static void trim_partial_utf8(char *s)
         else                         need = 1;  /* invalid lead byte: leave as is */
 
         if (need > k) {
-            s[len - k] = '\0';      /* incomplete: drop it along with its lead byte */
+            s[len - k] = '\0';
         }
         return;
     }
 }
 
-/* Truncates on a code point boundary if src does not fit */
 static void copy_utf8_trunc(char *dst, size_t cap, const char *src)
 {
     size_t n;
@@ -101,7 +93,7 @@ static void copy_utf8_trunc(char *dst, size_t cap, const char *src)
     pspsky_utf8_truncate(dst, cap - 1);
 }
 
-/* Copy that must not truncate, for JWT/DID/handle */
+/* Tokens and identifiers must not be truncated. */
 static int copy_exact(char *dst, size_t cap, const char *src)
 {
     size_t n;
@@ -168,11 +160,6 @@ static int urlencode(char *dst, size_t cap, const char *src)
     return PSPSKY_OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* JSON utilities                                                      */
-/* ------------------------------------------------------------------ */
-
-/* NULL unless obj[key] is a string */
 static const char *json_str(const cJSON *obj, const char *key)
 {
     const cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
@@ -183,7 +170,6 @@ static const char *json_str(const cJSON *obj, const char *key)
     return it->valuestring;
 }
 
-/* NULL unless obj[key] is an object */
 static const cJSON *json_obj(const cJSON *obj, const char *key)
 {
     const cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
@@ -194,12 +180,14 @@ static const cJSON *json_obj(const cJSON *obj, const char *key)
     return it;
 }
 
-/* 0 unless obj[key] is a positive number */
+/* 0 unless obj[key] is a positive integer representable as int */
 static int json_pos_int(const cJSON *obj, const char *key)
 {
     const cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
 
-    if (!cJSON_IsNumber(it) || it->valueint <= 0) {
+    if (!cJSON_IsNumber(it) ||
+        !(it->valuedouble >= 1.0 && it->valuedouble <= (double)INT_MAX) ||
+        it->valuedouble != (double)it->valueint) {
         return 0;
     }
     return it->valueint;
@@ -217,12 +205,7 @@ static long json_byte_offset(const cJSON *obj, const char *key)
     return (long)it->valuedouble;
 }
 
-/* ------------------------------------------------------------------ */
-/* Request execution and shared error classification                   */
-/* ------------------------------------------------------------------ */
-
-/* Performs one request and classifies the result. body and body_bin are
-   mutually exclusive; on success *out_body is the malloc'd 2xx body to free. */
+/* body and body_bin are mutually exclusive. The caller frees *out_body on success. */
 static int do_request_ex(const pspsky_transport_t *t,
                          const char *method, const char *url,
                          const char *bearer, const char *body,
@@ -248,7 +231,6 @@ static int do_request_ex(const pspsky_transport_t *t,
         return PSPSKY_E_ARG;
     }
 
-    /* Must be zeroed in full before any field is set */
     memset(&req, 0, sizeof(req));
     memset(&resp, 0, sizeof(resp));
     req.method       = method;
@@ -269,14 +251,12 @@ static int do_request_ex(const pspsky_transport_t *t,
     memcpy(terr, resp.errmsg, sizeof(resp.errmsg));
     terr[PSPSKY_HTTP_ERRMSG_MAX] = '\0';
 
-    /* Transport failures propagate unchanged */
     if (rc != PSPSKY_OK) {
         set_errmsg(errmsg, terr[0] != '\0' ? terr : NULL);
         free(resp.body);
         return rc;
     }
 
-    /* 2xx: the body goes to the caller */
     if (resp.status >= 200 && resp.status <= 299) {
         if (out_body != NULL) {
             *out_body = resp.body;
@@ -286,7 +266,6 @@ static int do_request_ex(const pspsky_transport_t *t,
         return PSPSKY_OK;
     }
 
-    /* Classify non-2xx statuses */
     if (resp.status == 429) {
         rc = PSPSKY_E_RATELIMIT;
     } else if (resp.status == 400 || resp.status == 401) {
@@ -325,7 +304,6 @@ static int do_request_ex(const pspsky_transport_t *t,
     return rc;
 }
 
-/* Thin wrapper for a JSON body, or no body at all */
 static int do_request(const pspsky_transport_t *t,
                       const char *method, const char *url,
                       const char *bearer, const char *body,
@@ -335,12 +313,7 @@ static int do_request(const pspsky_transport_t *t,
                          out_body, out_status, errmsg);
 }
 
-/* ------------------------------------------------------------------ */
-/* Session JSON -> pspsky_session_t                                    */
-/* ------------------------------------------------------------------ */
-
-/* require_ids also demands did and handle. Every length check runs first, so a
-   mid-way failure cannot leave the session partially overwritten. */
+/* Validate all fields before replacing the session; failures must leave it intact. */
 static int session_fill(const cJSON *root, pspsky_session_t *out, int require_ids)
 {
     const char *access  = json_str(root, "accessJwt");
@@ -381,10 +354,6 @@ static int session_fill(const cJSON *root, pspsky_session_t *out, int require_id
     }
     return PSPSKY_OK;
 }
-
-/* ------------------------------------------------------------------ */
-/* Low-level API implementation (internal, reports HTTP status)        */
-/* ------------------------------------------------------------------ */
 
 static int atp_create_session_impl(const pspsky_transport_t *t,
                                    const char *identifier,
@@ -480,7 +449,7 @@ static int atp_refresh_session_impl(const pspsky_transport_t *t,
     if (t == NULL || t->perform == NULL || sess == NULL) {
         return PSPSKY_E_ARG;
     }
-    /* An empty token is not a bad argument; let the server response decide */
+    /* Let the server classify empty tokens as authentication errors. */
 
     rc = do_request(t, "POST", EP_REFRESH_SESSION, sess->refresh_jwt, NULL,
                     &body, status, errmsg);
@@ -507,9 +476,7 @@ cleanup:
     return rc;
 }
 
-/* Returns the images array of an embed view, or NULL when there is none.
-   Only thumb/aspectRatio are ever looked at; sibling engagement fields are
-   not read, copied or logged. */
+/* Read image media only; quoted record contents may contain engagement data. */
 static const cJSON *embed_view_images(const cJSON *post)
 {
     const cJSON *embed = json_obj(post, "embed");
@@ -538,16 +505,12 @@ static const cJSON *embed_view_images(const cJSON *post)
     return cJSON_IsArray(images) ? images : NULL;
 }
 
-/* Fills img_count plus the first thumb URL and its aspect ratio */
+/* Keep missing images in place so placeholders preserve embed order. */
 static void post_read_images(const cJSON *post, pspsky_post_t *p)
 {
     const cJSON *images = embed_view_images(post);
-    const cJSON *first;
-    const cJSON *ratio;
-    const char  *thumb;
     int          n;
-    int          w;
-    int          h;
+    int          i;
 
     if (images == NULL) {
         return;
@@ -556,33 +519,41 @@ static void post_read_images(const cJSON *post, pspsky_post_t *p)
     if (n <= 0) {
         return;
     }
+    if (n > PSPSKY_MAX_IMAGES) {
+        n = PSPSKY_MAX_IMAGES;
+    }
     p->img_count = n;
 
-    first = cJSON_GetArrayItem(images, 0);
-    if (first == NULL) {
-        return;
-    }
+    for (i = 0; i < n; ++i) {
+        const cJSON *entry = cJSON_GetArrayItem(images, i);
+        const cJSON *ratio;
+        const char  *thumb;
+        pspsky_post_image_t *image = &p->images[i];
+        int w;
+        int h;
 
-    /* A URL that does not fit leaves thumb_url empty, which degrades to the
-       marker while img_count still reflects the post. */
-    thumb = json_str(first, "thumb");
-    if (thumb != NULL && thumb[0] != '\0') {
-        (void)copy_exact(p->thumb_url, sizeof(p->thumb_url), thumb);
-    }
+        if (!cJSON_IsObject(entry)) {
+            continue;
+        }
+        /* Leave missing or overlong URLs empty for the placeholder. */
+        thumb = json_str(entry, "thumb");
+        if (thumb != NULL && thumb[0] != '\0') {
+            (void)copy_exact(image->thumb_url, sizeof(image->thumb_url), thumb);
+        }
 
-    ratio = json_obj(first, "aspectRatio");
-    if (ratio == NULL) {
-        return;
-    }
-    w = json_pos_int(ratio, "width");
-    h = json_pos_int(ratio, "height");
-    if (w > 0 && h > 0) {
-        p->img_aspect_w = w;
-        p->img_aspect_h = h;
+        ratio = json_obj(entry, "aspectRatio");
+        if (ratio == NULL) {
+            continue;
+        }
+        w = json_pos_int(ratio, "width");
+        h = json_pos_int(ratio, "height");
+        if (w > 0 && h > 0) {
+            image->aspect_w = w;
+            image->aspect_h = h;
+        }
     }
 }
 
-/* 1 when the facet carries at least one link feature */
 static int facet_has_link(const cJSON *facet)
 {
     const cJSON *features = cJSON_GetObjectItemCaseSensitive(facet, "features");
@@ -601,7 +572,6 @@ static int facet_has_link(const cJSON *facet)
     return 0;
 }
 
-/* Sorts the collected ranges by start; stable, and n is at most 8 */
 static void sort_link_ranges(pspsky_post_t *p)
 {
     int i;
@@ -621,8 +591,7 @@ static void sort_link_ranges(pspsky_post_t *p)
     }
 }
 
-/* Fills the link ranges from record.facets; runs after text is stored because
-   the offsets are clipped to the truncated copy */
+/* Store text first: facet offsets are clipped to its truncated length. */
 static void post_read_link_facets(const cJSON *record, pspsky_post_t *p)
 {
     const cJSON *facets = cJSON_GetObjectItemCaseSensitive(record, "facets");
@@ -639,10 +608,10 @@ static void post_read_link_facets(const cJSON *record, pspsky_post_t *p)
         long end;
 
         if (p->link_count >= PSPSKY_MAX_LINK_RANGES) {
-            break;                  /* the rest is dropped, not an error */
+            break;  /* the rest is dropped, not an error */
         }
         if (!facet_has_link(facet)) {
-            continue;               /* mention/tag only */
+            continue;
         }
         index = json_obj(facet, "index");
         if (index == NULL) {
@@ -654,10 +623,10 @@ static void post_read_link_facets(const cJSON *record, pspsky_post_t *p)
             continue;
         }
         if ((size_t)start >= len) {
-            continue;               /* entirely past the stored text */
+            continue;
         }
         if ((size_t)end > len) {
-            end = (long)len;        /* truncation cut the tail off */
+            end = (long)len;
         }
         p->link_start[p->link_count] = (unsigned short)start;
         p->link_end[p->link_count]   = (unsigned short)end;
@@ -667,8 +636,115 @@ static void post_read_link_facets(const cJSON *record, pspsky_post_t *p)
     sort_link_ranges(p);
 }
 
-/* E_PARSE when handle or text is missing; the caller skips that element */
-static int post_from_feed_item(const cJSON *item, pspsky_post_t *p)
+/* Overlong URLs leave avatar_url empty so the UI uses the default avatar. */
+static void post_read_avatar(const cJSON *author, pspsky_post_t *p)
+{
+    const char *url = json_str(author, "avatar");
+    const char *preset;
+    int         n;
+
+    if (url == NULL || url[0] == '\0') {
+        return;
+    }
+    preset = strstr(url, AVATAR_PRESET);
+    if (preset == NULL) {
+        (void)copy_exact(p->avatar_url, sizeof(p->avatar_url), url);
+        return;
+    }
+    n = snprintf(p->avatar_url, sizeof(p->avatar_url), "%.*s%s%s",
+                 (int)(preset - url), url, AVATAR_THUMB_PRESET,
+                 preset + strlen(AVATAR_PRESET));
+    if (n < 0 || (size_t)n >= sizeof(p->avatar_url)) {
+        p->avatar_url[0] = '\0';
+    }
+}
+
+/* Display name, else handle, of a profile view; NULL when it has neither */
+static const char *profile_name(const cJSON *profile)
+{
+    const char *name = json_str(profile, "displayName");
+
+    if (name == NULL || name[0] == '\0') {
+        name = json_str(profile, "handle");
+    }
+    return (name != NULL && name[0] != '\0') ? name : NULL;
+}
+
+static int profile_is_self(const cJSON *profile, const char *self_did)
+{
+    const char *did = json_str(profile, "did");
+
+    return (self_did != NULL && self_did[0] != '\0' &&
+            did != NULL && strcmp(did, self_did) == 0);
+}
+
+/* Only repost reasons are displayed. */
+static void post_read_reason(const cJSON *item, const char *self_did,
+                             pspsky_post_t *p)
+{
+    const cJSON *reason = json_obj(item, "reason");
+    const cJSON *by;
+    const char  *type;
+    const char  *name;
+
+    if (reason == NULL) {
+        return;
+    }
+    type = json_str(reason, "$type");
+    by   = json_obj(reason, "by");
+    if (type == NULL || strcmp(type, REASON_REPOST) != 0 || by == NULL) {
+        return;
+    }
+    if (profile_is_self(by, self_did)) {
+        p->repost = PSPSKY_REPOST_BY_SELF;
+        return;
+    }
+    name = profile_name(by);
+    if (name == NULL) {
+        return;
+    }
+    copy_utf8_trunc(p->repost_by, sizeof(p->repost_by), name);
+    p->repost = PSPSKY_REPOST_BY;
+}
+
+/* A reply without a hydrated parent still needs a reply indicator. */
+static void post_read_reply(const cJSON *item, const cJSON *record,
+                            const char *self_did, pspsky_post_t *p)
+{
+    const cJSON *reply  = json_obj(item, "reply");
+    const cJSON *parent = (reply != NULL) ? json_obj(reply, "parent") : NULL;
+    const cJSON *author;
+    const char  *type;
+    const char  *name;
+
+    if (parent == NULL) {
+        if (json_obj(record, "reply") != NULL) {
+            p->reply = PSPSKY_REPLY_TO_POST;
+        }
+        return;
+    }
+    type = json_str(parent, "$type");
+    if (type != NULL && strcmp(type, PARENT_BLOCKED) == 0) {
+        p->reply = PSPSKY_REPLY_TO_BLOCKED;
+        return;
+    }
+    author = json_obj(parent, "author");
+    if (author != NULL && profile_is_self(author, self_did)) {
+        p->reply = PSPSKY_REPLY_TO_SELF;
+        return;
+    }
+    name = (author != NULL) ? profile_name(author) : NULL;
+    if (name == NULL) {
+        p->reply = PSPSKY_REPLY_TO_POST;  /* notFoundPost has no author */
+        return;
+    }
+    copy_utf8_trunc(p->reply_to, sizeof(p->reply_to), name);
+    p->reply = PSPSKY_REPLY_TO;
+}
+
+/* Missing handle or text makes the caller skip this item. self_did may be NULL. */
+static int post_from_feed_item(const cJSON *item, const char *self_did,
+                               pspsky_post_t *p)
 {
     const cJSON *post;
     const cJSON *author;
@@ -697,17 +773,16 @@ static int post_from_feed_item(const cJSON *item, pspsky_post_t *p)
         return PSPSKY_E_PARSE;
     }
 
-    display = json_str(author, "displayName");   /* optional */
-    created = json_str(record, "createdAt");     /* optional */
+    display = json_str(author, "displayName");
+    created = json_str(record, "createdAt");
 
     memset(p, 0, sizeof(*p));
 
-    /* Presence only: a quote embed can carry engagement counts inside, so
-       nothing below this key is ever read */
+    /* Check presence only; quote contents may contain engagement counts. */
     p->has_embed =
         (cJSON_GetObjectItemCaseSensitive(record, "embed") != NULL) ? 1 : 0;
 
-    /* The hydrated view sits next to record and carries the thumb URLs */
+    /* Thumbnail URLs come from the hydrated view, outside record. */
     post_read_images(post, p);
 
     copy_utf8_trunc(p->handle,       sizeof(p->handle),       handle);
@@ -716,6 +791,10 @@ static int post_from_feed_item(const cJSON *item, pspsky_post_t *p)
     copy_utf8_trunc(p->created_at,   sizeof(p->created_at),   created);
 
     post_read_link_facets(record, p);
+
+    post_read_avatar(author, p);
+    post_read_reason(item, self_did, p);
+    post_read_reply(item, record, self_did, p);
 
     /* Parse the raw string, not the truncated copy */
     p->created_at_unix = (created != NULL) ? pspsky_iso8601_parse(created) : -1;
@@ -749,7 +828,6 @@ static int atp_get_timeline_impl(const pspsky_transport_t *t,
     if (t == NULL || t->perform == NULL || sess == NULL || out == NULL) {
         return PSPSKY_E_ARG;
     }
-    /* Empty token: same reasoning as above */
 
     memset(out, 0, sizeof(*out));
 
@@ -796,8 +874,9 @@ static int atp_get_timeline_impl(const pspsky_transport_t *t,
         if (out->count >= PSPSKY_MAX_POSTS) {
             break;
         }
-        /* Skip malformed elements and keep going */
-        if (post_from_feed_item(item, &out->posts[out->count]) == PSPSKY_OK) {
+
+        if (post_from_feed_item(item, sess->did,
+                                &out->posts[out->count]) == PSPSKY_OK) {
             out->count++;
         }
     }
@@ -806,7 +885,7 @@ static int atp_get_timeline_impl(const pspsky_transport_t *t,
     if (cur != NULL && cur[0] != '\0' && strlen(cur) < sizeof(out->cursor)) {
         (void)copy_exact(out->cursor, sizeof(out->cursor), cur);
     } else {
-        out->cursor[0] = '\0';   /* missing or too long becomes empty */
+        out->cursor[0] = '\0';  /* missing or too long becomes empty */
     }
 
     rc = PSPSKY_OK;
@@ -819,7 +898,7 @@ cleanup:
     return rc;
 }
 
-/* Builds record.embed; the caller owns the result. Escaping is left to cJSON. */
+/* The caller owns the returned tree. Attached children are freed with their parent. */
 static cJSON *build_embed_images(const pspsky_embed_image_t *image)
 {
     cJSON *embed  = NULL;
@@ -842,14 +921,12 @@ static cJSON *build_embed_images(const pspsky_embed_image_t *image)
         cJSON_Delete(images);
         goto fail;
     }
-    /* embed now owns images */
 
     entry = cJSON_CreateObject();
     if (entry == NULL || !cJSON_AddItemToArray(images, entry)) {
         cJSON_Delete(entry);
         goto fail;
     }
-    /* images now owns entry */
 
     /* alt is required, and an empty string is a valid value */
     if (cJSON_AddStringToObject(entry, "alt", image->alt) == NULL) {
@@ -861,7 +938,6 @@ static cJSON *build_embed_images(const pspsky_embed_image_t *image)
         cJSON_Delete(blob);
         goto fail;
     }
-    /* entry now owns blob */
 
     if (cJSON_AddStringToObject(blob, "$type", "blob") == NULL) {
         goto fail;
@@ -871,7 +947,6 @@ static cJSON *build_embed_images(const pspsky_embed_image_t *image)
         cJSON_Delete(ref);
         goto fail;
     }
-    /* blob now owns ref */
 
     if (cJSON_AddStringToObject(ref, "$link", image->blob.cid) == NULL ||
         cJSON_AddStringToObject(blob, "mimeType", image->blob.mime_type) == NULL ||
@@ -879,14 +954,13 @@ static cJSON *build_embed_images(const pspsky_embed_image_t *image)
         goto fail;
     }
 
-    /* aspectRatio only when both sides are positive */
     if (image->aspect_w > 0 && image->aspect_h > 0) {
         aspect = cJSON_CreateObject();
         if (aspect == NULL || !cJSON_AddItemToObject(entry, "aspectRatio", aspect)) {
             cJSON_Delete(aspect);
             goto fail;
         }
-        /* entry now owns aspect */
+
         if (cJSON_AddNumberToObject(aspect, "width", (double)image->aspect_w) == NULL ||
             cJSON_AddNumberToObject(aspect, "height", (double)image->aspect_h) == NULL) {
             goto fail;
@@ -925,16 +999,14 @@ static int atp_create_post_impl(const pspsky_transport_t *t,
         return PSPSKY_E_ARG;
     }
     if (text_utf8 == NULL || text_utf8[0] == '\0') {
-        return PSPSKY_E_ARG;   /* never send an empty post body */
+        return PSPSKY_E_ARG;
     }
     if (image != NULL && image->blob.cid[0] == '\0') {
-        return PSPSKY_E_ARG;   /* never build an embed without a cid */
+        return PSPSKY_E_ARG;
     }
-    /* Empty did/accessJwt: same reasoning as above */
 
     iso = created_at_iso;
     if (iso == NULL || iso[0] == '\0') {
-        /* Only when the caller supplied no timestamp */
         time_t now = time(NULL);
         if (now == (time_t)-1) {
             return PSPSKY_E_ARG;
@@ -959,20 +1031,18 @@ static int atp_create_post_impl(const pspsky_transport_t *t,
         rc = PSPSKY_E_NOMEM;
         goto cleanup;
     }
-    /* root now owns record */
+    /* root owns record after attachment. */
 
     if (cJSON_AddStringToObject(root, "repo", sess->did) == NULL ||
         cJSON_AddStringToObject(root, "collection", POST_COLLECTION) == NULL ||
         cJSON_AddStringToObject(record, "$type", POST_COLLECTION) == NULL ||
         cJSON_AddStringToObject(record, "text", text_utf8) == NULL ||
         cJSON_AddStringToObject(record, "createdAt", iso) == NULL ||
-        /* Directly under record on both paths, embed or not */
         cJSON_AddStringToObject(record, "via", PSPSKY_VIA_NAME) == NULL) {
         rc = PSPSKY_E_NOMEM;
         goto cleanup;
     }
 
-    /* image == NULL omits the key entirely, matching plain create_post */
     if (image != NULL) {
         cJSON *embed = build_embed_images(image);
 
@@ -981,7 +1051,7 @@ static int atp_create_post_impl(const pspsky_transport_t *t,
             rc = PSPSKY_E_NOMEM;
             goto cleanup;
         }
-        /* record now owns embed */
+        /* record owns embed after attachment. */
     }
 
     json = cJSON_PrintUnformatted(root);
@@ -990,7 +1060,6 @@ static int atp_create_post_impl(const pspsky_transport_t *t,
         goto cleanup;
     }
 
-    /* The response uri/cid are unused, so the body is discarded */
     rc = do_request(t, "POST", EP_CREATE_RECORD, sess->access_jwt, json,
                     NULL, status, errmsg);
 
@@ -1027,7 +1096,7 @@ static int atp_upload_blob_impl(const pspsky_transport_t *t,
     if (status != NULL) {
         *status = 0;
     }
-    /* Bad arguments must not reach the transport */
+
     if (t == NULL || t->perform == NULL || sess == NULL ||
         data == NULL || out == NULL ||
         len == 0 || len > (size_t)PSPSKY_IMAGE_MAX_BYTES ||
@@ -1065,7 +1134,7 @@ static int atp_upload_blob_impl(const pspsky_transport_t *t,
     }
     link = json_str(ref, "$link");
     if (link == NULL || link[0] == '\0' || strlen(link) >= sizeof(out->cid)) {
-        rc = PSPSKY_E_PARSE;    /* cid is required */
+        rc = PSPSKY_E_PARSE;
         goto cleanup;
     }
     (void)copy_exact(out->cid, sizeof(out->cid), link);
@@ -1098,10 +1167,6 @@ cleanup:
     return rc;
 }
 
-/* ------------------------------------------------------------------ */
-/* Low-level API (public)                                              */
-/* ------------------------------------------------------------------ */
-
 int pspsky_atp_create_session(const pspsky_transport_t *t,
                               const char *identifier,
                               const char *app_password,
@@ -1131,7 +1196,6 @@ int pspsky_atp_get_timeline(const pspsky_transport_t *t,
     return atp_get_timeline_impl(t, sess, limit, cursor, out, errmsg, &status);
 }
 
-/* Compatibility wrapper for the _ex variant with image = NULL */
 int pspsky_atp_create_post(const pspsky_transport_t *t,
                            const pspsky_session_t *sess,
                            const char *text_utf8,
@@ -1154,7 +1218,7 @@ int pspsky_atp_create_post_ex(const pspsky_transport_t *t,
                                 errmsg, &status);
 }
 
-/* No auth and no refresh retry: the CDN is public, so a retry buys nothing. */
+/* Public CDN requests do not use authentication or session refresh. */
 int pspsky_atp_fetch_image(const pspsky_transport_t *t,
                            const char *url,
                            unsigned char **out, size_t *out_len,
@@ -1179,7 +1243,6 @@ int pspsky_atp_fetch_image(const pspsky_transport_t *t,
         return PSPSKY_E_ARG;
     }
 
-    /* Must be zeroed in full before any field is set */
     memset(&req, 0, sizeof(req));
     memset(&resp, 0, sizeof(resp));
     req.method      = "GET";
@@ -1207,7 +1270,7 @@ int pspsky_atp_fetch_image(const pspsky_transport_t *t,
         return PSPSKY_E_HTTP;
     }
 
-    /* Ownership of the body moves to the caller; it may contain NUL bytes */
+    /* The caller owns the body; use body_len because images may contain NUL bytes. */
     *out     = (unsigned char *)resp.body;
     *out_len = resp.body_len;
     return PSPSKY_OK;
@@ -1224,10 +1287,6 @@ int pspsky_atp_upload_blob(const pspsky_transport_t *t,
     return atp_upload_blob_impl(t, sess, data, len, mime_type, out,
                                 errmsg, &status);
 }
-
-/* ------------------------------------------------------------------ */
-/* High-level client                                                   */
-/* ------------------------------------------------------------------ */
 
 static void client_record(pspsky_client_t *c, int rc, int status, const char *msg)
 {
@@ -1310,14 +1369,13 @@ int pspsky_client_get_timeline(pspsky_client_t *c, int limit,
         errmsg[0] = '\0';
         status = 0;
         rc = atp_get_timeline_impl(c->transport, &c->session, limit, cursor, out,
-                                   errmsg, &status);   /* retried exactly once */
+                                   errmsg, &status);
     }
 
     client_record(c, rc, status, errmsg);
     return rc;
 }
 
-/* Compatibility wrapper for the _ex variant with image = NULL */
 int pspsky_client_create_post(pspsky_client_t *c, const char *text_utf8,
                               const char *created_at_iso)
 {

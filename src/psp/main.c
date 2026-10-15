@@ -1,7 +1,4 @@
-/*
- * PSPSky - entry point and application state machine.
- * Every network call blocks, so the UI is drawn one frame beforehand.
- */
+/* Network calls block; draw the status before starting a request. */
 
 #include <pspkernel.h>
 #include <psprtc.h>
@@ -34,89 +31,88 @@ PSP_MODULE_INFO("PSPSky", 0, 1, 1);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(-2048);
 
-/* ------------------------------------------------------------------ */
-/* Constants                                                           */
-/* ------------------------------------------------------------------ */
-
-#define APP_MAX_POSTS       100   /* posts kept in memory           */
-#define APP_TIMELINE_LIMIT  10    /* posts per getTimeline call     */
-#define APP_POST_MAX_CHARS  300   /* max characters per post        */
-#define APP_LOGIN_TRIES     3     /* max login attempts             */
-#define APP_NET_CONF_INDEX  1     /* connection profile 1           */
+#define APP_MAX_POSTS       100
+#define APP_TIMELINE_LIMIT  10
+#define APP_POST_MAX_CHARS  300
+#define APP_LOGIN_TRIES     3
+#define APP_NET_CONF_INDEX  1
 #define APP_NET_TIMEOUT_SEC 45
 
-/* Heap spent on decoded timeline thumbnails; past it, posts keep the marker. */
+/* Thumbnails beyond this heap budget remain placeholders. */
 #define APP_IMG_CACHE_MAX   (4 * 1024 * 1024)
+
+/* Avatars survive timeline refreshes and are shared by author URL. */
+#define APP_AVATAR_MAX      128
+#define APP_AVATAR_BYTES    (PSPSKY_UI_AVATAR_PX * PSPSKY_UI_AVATAR_PX * 3)
 
 #define APP_DEFAULT_BASEDIR "ms0:/PSP/GAME/PSPSKY/"
 
 #define APP_BASEDIR_MAX     256
 #define APP_PATH_MAX        (APP_BASEDIR_MAX + 32)
-/* The OSK limit is in characters; UTF-8 needs up to 3 bytes each. */
+/* The UCS-2 OSK needs up to 3 UTF-8 bytes per character. */
 #define APP_CRED_CHARS      128
 #define APP_CRED_BUF        (APP_CRED_CHARS * 3 + 8)
 #define APP_TEXT_BUF        (APP_POST_MAX_CHARS * 3 + 8)
 
-/* Positive, so it never collides with the OK/negative error codes. */
 #define APP_COMPOSE_BACK    1
 
-/* ------------------------------------------------------------------ */
-/* State (large structs are kept off the stack)                        */
-/* ------------------------------------------------------------------ */
+/* Keep large buffers off the PSP stack. */
 
 static pspsky_post_t      g_posts[APP_MAX_POSTS];
 static int                g_post_count;
 static char               g_cursor[PSPSKY_MAX_CURSOR];
 static int                g_has_more;
 
-/* Thumbnails parallel to g_posts; rgb is malloc'd and owned here. */
-static pspsky_ui_tl_image_t g_tl_images[APP_MAX_POSTS];
+/* Owns thumbnail RGB buffers; the UI borrows them. */
+static pspsky_ui_tl_image_t g_tl_images[APP_MAX_POSTS][PSPSKY_MAX_IMAGES];
 static size_t               g_img_cache_bytes;
-/* Decode scratch, reused for every thumbnail. ~90KB. */
+/* Shared decode scratch for thumbnails and avatars. */
 static unsigned char g_img_work[PSPSKY_UI_TL_IMG_MAX_W *
                                 PSPSKY_UI_TL_IMG_MAX_H * 3];
 
-static pspsky_client_t    g_client;    /* ~5KB  */
-static pspsky_timeline_t  g_tl;        /* ~36KB */
+/* Owns RGB buffers. NULL marks a failed fetch until the next refresh. */
+typedef struct {
+    char           url[PSPSKY_MAX_THUMB_URL];
+    unsigned char *rgb;
+} app_avatar_t;
+
+static app_avatar_t       g_avatars[APP_AVATAR_MAX];
+static int                g_avatar_count;
+/* Borrows avatar buffers from g_avatars, indexed like g_posts. */
+static pspsky_ui_avatar_t g_post_avatars[APP_MAX_POSTS];
+
+static pspsky_client_t    g_client;
+static pspsky_timeline_t  g_tl;
 static pspsky_transport_t g_transport;
 static pspsky_config_t    g_cfg;
-/* Result of the single config load done by init_language(). */
 static int                g_cfg_rc = PSPSKY_E_IO;
 
 static char g_basedir[APP_BASEDIR_MAX];
 static char g_cacert_path[APP_PATH_MAX];
 static char g_cfg_path[APP_PATH_MAX];
 
-/* cacert.pem self-test: replays each step of mbedtls_pk_load_file() so a load
-   failure can be pinned to one stage, reported once the UI is up. */
-
-/* Above this, skip the calloc rather than trust a bogus size. */
 #define CA_DIAG_SIZE_MAX (1L << 20)
 
-/* "stage not reached"; distinct from fseek's 0 and -1. */
+/* Stage not reached; distinct from fseek success and failure. */
 #define CA_DIAG_NA (-9)
 
 typedef struct {
-    int  open_ok;      /* fopen succeeded                     */
-    int  seek_end_rc;  /* fseek SEEK_END rc (-9 = skipped)    */
-    long size;         /* ftell (-1 = failed)                 */
-    int  seek_set_rc;  /* fseek SEEK_SET rc (-9 = skipped)    */
-    int  alloc_ok;     /* calloc succeeded                    */
-    long read_len;     /* fread bytes (-1 = skipped)          */
-    int  begin_ok;     /* starts with "-----BEGIN "           */
-    int  parse_rc;     /* mbedtls_x509_crt_parse_file rc      */
-    int  cert_count;   /* certificates parsed                 */
-    unsigned int free_kb; /* free memory at the time (KB)     */
+    int  open_ok;
+    int  seek_end_rc;  /* CA_DIAG_NA if skipped. */
+    long size;         /* -1 if unavailable. */
+    int  seek_set_rc;  /* CA_DIAG_NA if skipped. */
+    int  alloc_ok;
+    long read_len;     /* -1 if skipped. */
+    int  begin_ok;     /* PEM header found. */
+    int  parse_rc;     /* mbedtls_x509_crt_parse_file rc */
+    int  cert_count;
+    unsigned int free_kb;
 } cacert_diag_t;
 
 static cacert_diag_t g_ca;
-static char          g_ca_line[224];   /* formatted diagnostic line (ASCII) */
+static char          g_ca_line[224];
 
 static volatile int g_exit_requested;
-
-/* ------------------------------------------------------------------ */
-/* Exit callback (HOME menu)                                           */
-/* ------------------------------------------------------------------ */
 
 static int exit_callback(int arg1, int arg2, void *common)
 {
@@ -154,11 +150,7 @@ static int setup_callbacks(void)
     return thid;
 }
 
-/* ------------------------------------------------------------------ */
-/* Path resolution / current time                                      */
-/* ------------------------------------------------------------------ */
-
-/* A failed parse still leaves a version==0 head node, so skip those. */
+/* A failed parse can leave an empty head node with version == 0. */
 static int crt_chain_len(const mbedtls_x509_crt *crt)
 {
     const mbedtls_x509_crt *p;
@@ -170,7 +162,6 @@ static int crt_chain_len(const mbedtls_x509_crt *crt)
     return n;
 }
 
-/* Negative mbedTLS codes as "-0x2900", non-negative as decimal. */
 static void fmt_mbedtls_rc(char *out, size_t n, int rc)
 {
     if (rc < 0) {
@@ -180,11 +171,9 @@ static void fmt_mbedtls_rc(char *out, size_t n, int rc)
     }
 }
 
-/* Replays mbedtls_pk_load_file()'s steps, then runs the real parse too so the
-   two can be compared. */
+/* Check file I/O separately to distinguish read failures from parse errors. */
 static void cacert_selftest(void)
 {
-    /* Several hundred bytes; keep it off the stack. */
     static mbedtls_x509_crt crt;
     char  rcbuf[16];
     FILE *fp;
@@ -218,7 +207,6 @@ static void cacert_selftest(void)
         fclose(fp);
     }
 
-    /* init and free must always be paired. */
     mbedtls_x509_crt_init(&crt);
     g_ca.parse_rc   = mbedtls_x509_crt_parse_file(&crt, g_cacert_path);
     g_ca.cert_count = crt_chain_len(&crt);
@@ -227,7 +215,6 @@ static void cacert_selftest(void)
     g_ca.free_kb = (unsigned int)(sceKernelTotalFreeMemSize() / 1024u);
 
     fmt_mbedtls_rc(rcbuf, sizeof rcbuf, g_ca.parse_rc);
-    /* ASCII and language-independent; the caller adds a localised heading. */
     snprintf(g_ca_line, sizeof g_ca_line,
              "open=%s seek=%d size=%ld seek2=%d alloc=%s read=%ld "
              "begin=%s parse=%s certs=%d free=%uKB",
@@ -237,7 +224,6 @@ static void cacert_selftest(void)
              g_ca.free_kb);
 }
 
-/* 1 = every stage as expected, nothing to report. */
 static int cacert_diag_ok(void)
 {
     return (g_ca.open_ok &&
@@ -251,7 +237,6 @@ static int cacert_diag_ok(void)
             g_ca.cert_count > 0);
 }
 
-/* basedir is argv[0] up to the last '/', else APP_DEFAULT_BASEDIR. */
 static void resolve_paths(int argc, char *argv[])
 {
     g_basedir[0] = '\0';
@@ -259,7 +244,7 @@ static void resolve_paths(int argc, char *argv[])
     if (argc > 0 && argv != NULL && argv[0] != NULL) {
         const char *slash = strrchr(argv[0], '/');
         if (slash != NULL) {
-            size_t n = (size_t)(slash - argv[0]) + 1; /* include the '/' */
+            size_t n = (size_t)(slash - argv[0]) + 1;
             if (n > 0 && n < sizeof(g_basedir)) {
                 memcpy(g_basedir, argv[0], n);
                 g_basedir[n] = '\0';
@@ -279,8 +264,7 @@ static void resolve_paths(int argc, char *argv[])
     printf("PSPSky: %s\n", g_ca_line);
 }
 
-/* System language, overridden by lang= in the config. Call once, before any
-   UI string is produced. */
+/* Load once before any UI text; lang= overrides the system language. */
 static void init_language(void)
 {
     int syslang = -1;
@@ -301,7 +285,6 @@ static void init_language(void)
     }
 }
 
-/* Reports only on failure, then continues anyway. */
 static void report_cacert_diag(void)
 {
     static char buf[APP_PATH_MAX + sizeof g_ca_line + 128];
@@ -317,7 +300,6 @@ static void report_cacert_diag(void)
     pspsky_ui_message(buf);
 }
 
-/* UTC epoch seconds from the RTC, independent of time(). */
 static long long now_unix(void)
 {
     ScePspDateTime pt;
@@ -330,9 +312,10 @@ static long long now_unix(void)
                                 (int)pt.hour, (int)pt.minute, (int)pt.second);
 }
 
-/* mbedTLS validates certificate dates with time(), but the PSP newlib time()
- * does not return true UTC, so valid certificates are rejected. -Wl,--wrap=time
- * routes every caller here; __real_time is the fallback when the RTC fails. */
+/*
+ * PSP newlib time() is not UTC, which breaks TLS certificate date checks.
+ * The linker wraps time() to use the RTC, falling back if it is unavailable.
+ */
 extern time_t __real_time(time_t *t);
 
 time_t __wrap_time(time_t *t)
@@ -341,7 +324,6 @@ time_t __wrap_time(time_t *t)
     time_t    v;
 
     if (now <= 0) {
-        /* RTC unavailable */
         return __real_time(t);
     }
     v = (time_t)now;
@@ -351,18 +333,13 @@ time_t __wrap_time(time_t *t)
     return v;
 }
 
-/* ------------------------------------------------------------------ */
-/* Message helpers                                                     */
-/* ------------------------------------------------------------------ */
-
 static void net_progress(const char *msg_utf8, void *user)
 {
     (void)user;
     pspsky_ui_status(msg_utf8);
 }
 
-/* E_TLS is special-cased: its generic text tells the user to check the clock,
-   which contradicts the specific reason the transport already supplied. */
+/* Prefer the transport's TLS diagnosis over generic clock advice. */
 static void show_error(int err)
 {
     char buf[PSPSKY_ERRMSG_MAX + 128];
@@ -381,100 +358,257 @@ static void show_error(int err)
     pspsky_ui_message(buf);
 }
 
-/* ------------------------------------------------------------------ */
-/* Timeline model                                                      */
-/* ------------------------------------------------------------------ */
-
-/* Drops every cached thumbnail. The UI caches textures by post index, so it
-   has to let go of them before the buffers behind them are freed. */
+/* Invalidate UI textures before freeing the RGB buffers they reference. */
 static void img_cache_clear(void)
+{
+    int i, j;
+
+    pspsky_ui_timeline_invalidate(0);
+    for (i = 0; i < APP_MAX_POSTS; i++) {
+        for (j = 0; j < PSPSKY_MAX_IMAGES; j++) {
+            free((void *)g_tl_images[i][j].rgb);
+        }
+    }
+    memset(g_tl_images, 0, sizeof(g_tl_images));
+    memset(g_post_avatars, 0, sizeof(g_post_avatars));
+    g_img_cache_bytes = 0;
+}
+
+/* Call only after detaching posts from the avatar cache. */
+static void avatar_cache_clear(void)
 {
     int i;
 
     pspsky_ui_timeline_invalidate(0);
-    for (i = 0; i < APP_MAX_POSTS; i++) {
-        free((void *)g_tl_images[i].rgb);
+    for (i = 0; i < g_avatar_count; i++) {
+        free(g_avatars[i].rgb);
     }
-    memset(g_tl_images, 0, sizeof(g_tl_images));
-    g_img_cache_bytes = 0;
+    memset(g_avatars, 0, sizeof(g_avatars));
+    memset(g_post_avatars, 0, sizeof(g_post_avatars));
+    g_avatar_count = 0;
 }
 
-/* Fetches and decodes the first thumbnail of each post in
-   [start, g_post_count). Every failure is silent: the post keeps its marker. */
+/* Prune only after detaching posts; removing failed entries allows retries. */
+static void avatar_cache_prune(void)
+{
+    int i;
+    int kept = 0;
+
+    if (g_avatar_count > APP_AVATAR_MAX * 3 / 4) {
+        avatar_cache_clear();
+        return;
+    }
+    for (i = 0; i < g_avatar_count; i++) {
+        if (g_avatars[i].rgb != NULL) {
+            g_avatars[kept++] = g_avatars[i];
+        }
+    }
+    g_avatar_count = kept;
+}
+
+static int avatar_find(const char *url)
+{
+    int i;
+
+    for (i = 0; i < g_avatar_count; i++) {
+        if (strcmp(g_avatars[i].url, url) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Count each uncached URL once within the batch. */
+static int avatar_pending(int start, int i)
+{
+    const char *url = g_posts[i].avatar_url;
+    int         j;
+
+    if (url[0] == '\0' || avatar_find(url) >= 0) {
+        return 0;
+    }
+    for (j = start; j < i; j++) {
+        if (strcmp(g_posts[j].avatar_url, url) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Decode WebP or JPEG to a PSPSKY_UI_AVATAR_PX square in RGB888. */
+static int avatar_decode(const unsigned char *data, size_t len,
+                         unsigned char *out)
+{
+    int tw = 0;
+    int th = 0;
+    int sw = 0;
+    int sh = 0;
+    int rc;
+    int x, y;
+
+    rc = pspsky_webp_thumb_decode(data, len,
+                                  PSPSKY_UI_AVATAR_PX, PSPSKY_UI_AVATAR_PX,
+                                  g_img_work, sizeof(g_img_work),
+                                  &tw, &th, &sw, &sh);
+    if (rc != PSPSKY_OK) {
+        const char *mime = pspsky_image_sniff_mime(data, len);
+
+        if (mime == NULL || strcmp(mime, "image/jpeg") != 0) {
+            return rc;
+        }
+        rc = pspsky_jpeg_thumb_decode(data, len, g_img_work, sizeof(g_img_work),
+                                      &tw, &th, &sw, &sh);
+        if (rc != PSPSKY_OK) {
+            return rc;
+        }
+    }
+    if (tw < 1 || th < 1) {
+        return PSPSKY_E_PARSE;
+    }
+    for (y = 0; y < PSPSKY_UI_AVATAR_PX; y++) {
+        const unsigned char *src = g_img_work +
+            (size_t)(y * th / PSPSKY_UI_AVATAR_PX) * (size_t)tw * 3u;
+
+        for (x = 0; x < PSPSKY_UI_AVATAR_PX; x++) {
+            memcpy(out + ((size_t)y * PSPSKY_UI_AVATAR_PX + (size_t)x) * 3u,
+                   src + (size_t)(x * tw / PSPSKY_UI_AVATAR_PX) * 3u, 3);
+        }
+    }
+    return PSPSKY_OK;
+}
+
+/* Cache failures too, so posts by the same author do not repeat the request. */
+static int avatar_add(const char *url)
+{
+    app_avatar_t  *a;
+    unsigned char *body = NULL;
+    size_t         len  = 0;
+
+    if (g_avatar_count >= APP_AVATAR_MAX) {
+        return -1;
+    }
+    a = &g_avatars[g_avatar_count];
+    snprintf(a->url, sizeof(a->url), "%s", url);
+    a->rgb = NULL;
+
+    if (pspsky_atp_fetch_image(&g_transport, url, &body, &len, NULL) == PSPSKY_OK) {
+        unsigned char *rgb = (unsigned char *)malloc(APP_AVATAR_BYTES);
+
+        if (rgb != NULL && avatar_decode(body, len, rgb) == PSPSKY_OK) {
+            a->rgb = rgb;
+        } else {
+            free(rgb);
+        }
+    }
+    free(body);
+    if (a->rgb == NULL) {
+        printf("PSPSky: avatar unavailable: %s\n", url);
+    }
+    return g_avatar_count++;
+}
+
+/* Failed image requests leave placeholders without interrupting the timeline. */
 static void fetch_new_images(int start)
 {
     char msg[128];
-    int  i;
+    int  i, j;
     int  m = 0;
     int  n = 0;
+    int  room = APP_AVATAR_MAX - g_avatar_count;
 
     if (!g_cfg.show_images) {
         return;
     }
     for (i = start; i < g_post_count; i++) {
-        if (g_posts[i].thumb_url[0] != '\0') {
+        if (room > 0 && avatar_pending(start, i)) {
+            room--;
             m++;
         }
+        for (j = 0; j < g_posts[i].img_count && j < PSPSKY_MAX_IMAGES; j++) {
+            if (g_posts[i].images[j].thumb_url[0] != '\0') {
+                m++;
+            }
+        }
     }
-    if (m == 0) {
-        return;
+
+    /* Fetch small avatars before larger attachments. */
+    for (i = start; i < g_post_count; i++) {
+        int k;
+
+        if (g_posts[i].avatar_url[0] == '\0') {
+            continue;
+        }
+        k = avatar_find(g_posts[i].avatar_url);
+        if (k < 0 && g_avatar_count < APP_AVATAR_MAX) {
+            n++;
+            snprintf(msg, sizeof(msg), pspsky_tr(PSPSKY_STR_ST_FETCHING_IMAGES),
+                     n, m);
+            pspsky_ui_status(msg);
+            k = avatar_add(g_posts[i].avatar_url);
+        }
+        if (k >= 0) {
+            g_post_avatars[i].rgb = g_avatars[k].rgb;
+        }
     }
 
     for (i = start; i < g_post_count; i++) {
-        unsigned char *body = NULL;
-        unsigned char *rgb;
-        size_t         len  = 0;
-        size_t         sz;
-        int            tw   = 0;
-        int            th   = 0;
-        int            sw   = 0;   /* source dims; unused, tw/th are shown */
-        int            sh   = 0;
-        int            decoded;
+        int max_w = (g_posts[i].img_count > 1) ? PSPSKY_UI_TL_GRID_COL_W
+                                                : PSPSKY_UI_TL_IMG_MAX_W;
 
-        if (g_posts[i].thumb_url[0] == '\0') {
-            continue;
-        }
-        n++;
-        /* Budget spent: stop paying for transfers that cannot be kept. */
-        if (g_img_cache_bytes >= (size_t)APP_IMG_CACHE_MAX) {
-            continue;
-        }
+        for (j = 0; j < g_posts[i].img_count && j < PSPSKY_MAX_IMAGES; j++) {
+            unsigned char *body = NULL;
+            unsigned char *rgb;
+            size_t         len  = 0;
+            size_t         sz;
+            int            tw   = 0;
+            int            th   = 0;
+            int            sw   = 0;
+            int            sh   = 0;
+            int            decoded;
 
-        snprintf(msg, sizeof(msg), pspsky_tr(PSPSKY_STR_ST_FETCHING_IMAGES),
-                 n, m);
-        pspsky_ui_status(msg);
+            if (g_posts[i].images[j].thumb_url[0] == '\0') {
+                continue;
+            }
+            n++;
+            /* Skip transfers once the decoded image cache is full. */
+            if (g_img_cache_bytes >= (size_t)APP_IMG_CACHE_MAX) {
+                continue;
+            }
 
-        /* The reason never reaches the user, so no errmsg buffer is kept. */
-        decoded = 0;
-        if (pspsky_atp_fetch_image(&g_transport, g_posts[i].thumb_url,
-                                   &body, &len, NULL) == PSPSKY_OK &&
-            pspsky_webp_thumb_decode(body, len,
-                                     PSPSKY_UI_TL_IMG_MAX_W,
-                                     PSPSKY_UI_TL_IMG_MAX_H,
-                                     g_img_work, sizeof(g_img_work),
-                                     &tw, &th, &sw, &sh) == PSPSKY_OK) {
-            decoded = 1;
-        }
-        /* fetch_image leaves body NULL unless it handed one over. */
-        free(body);
-        if (!decoded) {
-            printf("PSPSky: thumbnail %d unavailable\n", i);
-            continue;
-        }
+            snprintf(msg, sizeof(msg), pspsky_tr(PSPSKY_STR_ST_FETCHING_IMAGES),
+                     n, m);
+            pspsky_ui_status(msg);
 
-        sz = (size_t)tw * (size_t)th * 3u;
-        if (g_img_cache_bytes + sz > (size_t)APP_IMG_CACHE_MAX) {
-            continue;
+            decoded = 0;
+            if (pspsky_atp_fetch_image(&g_transport,
+                                       g_posts[i].images[j].thumb_url,
+                                       &body, &len, NULL) == PSPSKY_OK &&
+                pspsky_webp_thumb_decode(body, len, max_w,
+                                         PSPSKY_UI_TL_IMG_MAX_H,
+                                         g_img_work, sizeof(g_img_work),
+                                         &tw, &th, &sw, &sh) == PSPSKY_OK) {
+                decoded = 1;
+            }
+            free(body);
+            if (!decoded) {
+                printf("PSPSky: thumbnail %d/%d unavailable\n", i, j);
+                continue;
+            }
+
+            sz = (size_t)tw * (size_t)th * 3u;
+            if (g_img_cache_bytes + sz > (size_t)APP_IMG_CACHE_MAX) {
+                continue;
+            }
+            rgb = (unsigned char *)malloc(sz);
+            if (rgb == NULL) {
+                continue;
+            }
+            memcpy(rgb, g_img_work, sz);
+            g_tl_images[i][j].rgb = rgb;
+            g_tl_images[i][j].w   = (short)tw;
+            g_tl_images[i][j].h   = (short)th;
+            g_img_cache_bytes += sz;
         }
-        rgb = (unsigned char *)malloc(sz);
-        if (rgb == NULL) {
-            continue;
-        }
-        memcpy(rgb, g_img_work, sz);
-        g_tl_images[i].rgb = rgb;
-        g_tl_images[i].w   = (short)tw;
-        g_tl_images[i].h   = (short)th;
-        g_img_cache_bytes += sz;
     }
 }
 
@@ -485,7 +619,6 @@ static void timeline_clear(void)
     g_has_more   = 0;
 }
 
-/* Appends to g_posts and updates cursor/has_more. */
 static void timeline_append(const pspsky_timeline_t *tl)
 {
     int i;
@@ -494,11 +627,9 @@ static void timeline_append(const pspsky_timeline_t *tl)
         g_posts[g_post_count++] = tl->posts[i];
     }
     snprintf(g_cursor, sizeof(g_cursor), "%s", tl->cursor);
-    /* Stop offering more once the cap is reached. */
     g_has_more = (g_cursor[0] != '\0' && g_post_count < APP_MAX_POSTS) ? 1 : 0;
 }
 
-/* REFRESH */
 static int timeline_reload(void)
 {
     int rc;
@@ -509,6 +640,7 @@ static int timeline_reload(void)
         return rc;
     }
     img_cache_clear();
+    avatar_cache_prune();
     timeline_clear();
     timeline_append(&g_tl);
     fetch_new_images(0);
@@ -516,7 +648,6 @@ static int timeline_reload(void)
     return PSPSKY_OK;
 }
 
-/* LOAD_OLDER */
 static int timeline_load_older(void)
 {
     int rc;
@@ -539,10 +670,6 @@ static int timeline_load_older(void)
     pspsky_ui_timeline_invalidate(0);
     return PSPSKY_OK;
 }
-
-/* ------------------------------------------------------------------ */
-/* Authentication                                                      */
-/* ------------------------------------------------------------------ */
 
 static int prompt_credentials(pspsky_config_t *cfg)
 {
@@ -590,13 +717,12 @@ static int prompt_credentials(pspsky_config_t *cfg)
     return PSPSKY_OK;
 }
 
-/* from_config=1 means the credentials came from the file, so they are not
-   written back on success. */
+/* Save credentials only when entered through the OSK. */
 static int app_login(int from_config)
 {
     int attempt;
     int rc      = PSPSKY_E_AUTH;
-    int entered = from_config ? 0 : 1;   /* entered via OSK = worth saving */
+    int entered = from_config ? 0 : 1;
 
     for (attempt = 1; attempt <= APP_LOGIN_TRIES; attempt++) {
         pspsky_ui_status(pspsky_tr(PSPSKY_STR_ST_LOGGING_IN));
@@ -617,14 +743,12 @@ static int app_login(int from_config)
         }
 
         if (rc == PSPSKY_E_AUTH) {
-            /* wrong credentials: ask again */
             int prc = prompt_credentials(&g_cfg);
             if (prc != PSPSKY_OK) {
                 return prc;
             }
             entered = 1;
         } else {
-            /* otherwise ask whether to retry */
             if (!pspsky_ui_confirm(pspsky_tr(PSPSKY_STR_CONFIRM_RETRY))) {
                 return PSPSKY_E_CANCELLED;
             }
@@ -633,11 +757,6 @@ static int app_login(int from_config)
     return rc;
 }
 
-/* ------------------------------------------------------------------ */
-/* Composing a post                                                    */
-/* ------------------------------------------------------------------ */
-
-/* Returns 0 on failure, after showing a message. */
 static int compose_now_iso(char *iso, size_t cap)
 {
     if (pspsky_iso8601_format(now_unix(), iso, cap) != PSPSKY_OK) {
@@ -647,7 +766,6 @@ static int compose_now_iso(char *iso, size_t cap)
     return 1;
 }
 
-/* img=NULL produces exactly the text-only body. */
 static int compose_send(const char *text, const char *iso,
                         const pspsky_embed_image_t *img)
 {
@@ -662,7 +780,7 @@ static int compose_send(const char *text, const char *iso,
     return timeline_reload();
 }
 
-/* Rejects oversize files on size alone, before allocating. Caller frees. */
+/* Reject oversized files before allocating; the caller owns *out_buf. */
 static int load_image_file(const char *path, unsigned char **out_buf,
                            size_t *out_len)
 {
@@ -740,16 +858,13 @@ static int pick_and_load_image(char *path_out, size_t path_cap,
                 *out_mime = mime;
                 return PSPSKY_OK;
             }
-            /* Extension lies about the content: reject here, not at the
-               server. */
             free(*out_buf);
             *out_buf = NULL;
             *out_len = 0;
             pspsky_ui_message(pspsky_tr(PSPSKY_STR_MSG_IMG_UNSUPPORTED));
-            continue;   /* back to the browser */
+            continue;
         }
         if (rc == PSPSKY_E_NOMEM) {
-            /* Re-picking would fail the same way. */
             pspsky_ui_message(pspsky_strerror(PSPSKY_E_NOMEM));
             return APP_COMPOSE_BACK;
         }
@@ -758,20 +873,17 @@ static int pick_and_load_image(char *path_out, size_t path_cap,
         } else {
             pspsky_ui_message(pspsky_tr(PSPSKY_STR_MSG_IMG_READ_FAIL));
         }
-        /* back to the browser */
     }
 }
 
 /* APP_COMPOSE_BACK returns to the confirm screen with the text intact. */
 static int app_compose_with_image(const char *text)
 {
-    /* ~850 bytes; keep off the stack. */
     static pspsky_embed_image_t img;
     static char    alt_raw[APP_TEXT_BUF];
     static char    img_path[PSPSKY_UI_PICK_PATH_MAX];
     unsigned char *buf  = NULL;
     size_t         len  = 0;
-    /* Sniffed from the content; a static literal. */
     const char    *mime = NULL;
     char           iso[32];
     int            w    = 0;
@@ -779,13 +891,12 @@ static int app_compose_with_image(const char *text)
     int            is_png;
     int            rc;
 
-    /* Cross re-picks; the text lives in app_compose and is never lost. */
     for (;;) {
         unsigned char *thumb = NULL;
         int            tw    = 0;
         int            th    = 0;
-        int            sw    = 0;   /* source dims from thumb_decode;   */
-        int            sh    = 0;   /* unused, w/h are what is shown    */
+        int            sw    = 0;
+        int            sh    = 0;
         int            ok;
 
         if (pick_and_load_image(img_path, sizeof(img_path),
@@ -805,8 +916,7 @@ static int app_compose_with_image(const char *text)
             h = 0;
         }
 
-        /* One buffer shared by both decoders; any failure just means no
-           preview, never an abort. */
+        /* A preview failure does not prevent uploading the original image. */
         pspsky_ui_status(pspsky_tr(PSPSKY_STR_ST_PREVIEW_PREP));
         thumb = (unsigned char *)malloc(PSPSKY_JPEG_THUMB_MAX_RGB);
         if (thumb != NULL) {
@@ -827,8 +937,7 @@ static int app_compose_with_image(const char *text)
             }
         }
 
-        /* pv->rgb is uploaded once before the UI loop, so it can be freed as
-           soon as this returns. */
+        /* The preview does not retain thumb after returning. */
         {
             pspsky_ui_preview_t pv = { img_path, len, w, h, thumb, tw, th };
             ok = pspsky_ui_preview_image(&pv);
@@ -837,9 +946,8 @@ static int app_compose_with_image(const char *text)
         thumb = NULL;
 
         if (ok) {
-            break;      /* confirmed */
+            break;
         }
-        /* re-pick: drop the buffer and go back to the browser */
         free(buf);
         buf = NULL;
     }
@@ -848,8 +956,7 @@ static int app_compose_with_image(const char *text)
     img.aspect_w = w;
     img.aspect_h = h;
 
-    /* Last UI step: a blob can expire if anything blocks between uploadBlob
-       and createRecord. Cancelling here just means alt="". */
+    /* Collect alt text before upload: blobs can expire before createRecord. */
     alt_raw[0] = '\0';
     if (pspsky_osk_input(pspsky_tr(PSPSKY_STR_OSK_ALT), "",
                          APP_POST_MAX_CHARS,
@@ -858,14 +965,12 @@ static int app_compose_with_image(const char *text)
         snprintf(img.alt, sizeof(img.alt), "%s", alt_raw);
     }
 
-    /* buf must live until this returns: libcurl does not copy it, and an
-       expired session makes upload_blob refresh and send again. */
+    /* Keep buf alive through upload and any authentication retry; curl borrows it. */
     pspsky_ui_status(pspsky_tr(PSPSKY_STR_ST_UPLOADING));
     rc = pspsky_client_upload_blob(&g_client, buf, len, mime, &img.blob);
     free(buf);
     buf = NULL;
     if (rc != PSPSKY_OK) {
-        /* app_main_loop drives re-login on E_AUTH_EXPIRED. */
         return rc;
     }
 
@@ -882,7 +987,6 @@ static int app_compose(void)
     char iso[32];
     int  rc;
 
-    /* Text is required even when an image is attached. */
     rc = pspsky_osk_input(pspsky_tr(PSPSKY_STR_OSK_COMPOSE), "", APP_POST_MAX_CHARS,
                           text, sizeof(text));
     if (rc == PSPSKY_E_CANCELLED) {
@@ -900,7 +1004,6 @@ static int app_compose(void)
         return PSPSKY_OK;
     }
 
-    /* Leaving the image flow returns here with the text intact. */
     for (;;) {
         pspsky_ui_compose_choice_t choice = pspsky_ui_compose_confirm(text);
 
@@ -917,14 +1020,9 @@ static int app_compose(void)
             }
             return compose_send(text, iso, NULL);
         }
-        /* CANCEL: discard */
         return PSPSKY_OK;
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* Main loop                                                           */
-/* ------------------------------------------------------------------ */
 
 static void app_main_loop(void)
 {
@@ -939,6 +1037,7 @@ static void app_main_loop(void)
         view.now_unix  = now_unix();
         view.my_handle = g_client.session.handle;
         view.images    = g_tl_images;
+        view.avatars   = g_post_avatars;
 
         act = pspsky_ui_timeline_frame(&view);
         rc  = PSPSKY_OK;
@@ -973,7 +1072,6 @@ static void app_main_loop(void)
             if (app_login(1) != PSPSKY_OK) {
                 return;
             }
-            /* Pass the real rc: a hardcoded one contradicts the TLS message. */
             rc = timeline_reload();
             if (rc != PSPSKY_OK) {
                 show_error(rc);
@@ -983,10 +1081,6 @@ static void app_main_loop(void)
         }
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* Entry point                                                         */
-/* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[])
 {
@@ -1001,13 +1095,10 @@ int main(int argc, char *argv[])
     setup_callbacks();
     resolve_paths(argc, argv);
 
-    /* Must settle before any UI string. */
     init_language();
 
-    /* No UI to ask through if this fails, so exit directly. */
     rc = pspsky_ui_init();
     if (rc != PSPSKY_OK) {
-        /* Console only, and deliberately not localised. */
         printf("PSPSky: ui_init failed (%d: %s)\n", rc, pspsky_strerror(rc));
         sceKernelDelayThread(3 * 1000 * 1000);
         sceKernelExitGame();
@@ -1016,7 +1107,6 @@ int main(int argc, char *argv[])
 
     report_cacert_diag();
 
-    /* Network */
     pspsky_ui_status(pspsky_tr(PSPSKY_STR_ST_NET_INIT));
     rc = pspsky_net_init();
     if (rc != PSPSKY_OK) {
@@ -1032,7 +1122,6 @@ int main(int argc, char *argv[])
         goto quit_net;
     }
 
-    /* HTTP transport */
     pspsky_ui_status(pspsky_tr(PSPSKY_STR_ST_TRANSPORT_INIT));
     rc = pspsky_curl_transport_init(&g_transport, g_cacert_path);
     if (rc != PSPSKY_OK) {
@@ -1040,8 +1129,7 @@ int main(int argc, char *argv[])
         goto quit_net;
     }
 
-    /* Already loaded by init_language(); a hand-written lang= survives an
-       otherwise unusable config and is written back on save. */
+    /* Preserve language and image settings when replacing invalid credentials. */
     from_config = (g_cfg_rc == PSPSKY_OK) ? 1 : 0;
     if (!from_config) {
         memset(g_cfg.identifier, 0, sizeof(g_cfg.identifier));
@@ -1057,23 +1145,19 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Login */
     rc = app_login(from_config);
     if (rc != PSPSKY_OK) {
         goto quit_all;
     }
 
-    /* First timeline fetch */
     rc = timeline_reload();
     if (rc != PSPSKY_OK) {
         show_error(rc);
-        /* Start empty; L re-fetches. */
         pspsky_ui_timeline_invalidate(1);
     }
 
     app_main_loop();
 
-    /* Cleanup */
 quit_all:
     pspsky_curl_transport_term(&g_transport);
 quit_net:
@@ -1081,6 +1165,7 @@ quit_net:
     pspsky_net_term();
 quit_ui:
     img_cache_clear();
+    avatar_cache_clear();
     pspsky_ui_term();
     sceKernelExitGame();
     return 0;

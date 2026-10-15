@@ -6,7 +6,7 @@ EBOOT.PBP
 PARAM.SFO
 build/
 
-# Host-side test harness (not part of the public distribution)
+# Local test harness
 tests/
 Makefile.host
 

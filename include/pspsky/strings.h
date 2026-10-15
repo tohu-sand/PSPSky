@@ -1,11 +1,9 @@
-/* UI string table and language selection; tables live in src/core/strings.c. */
 #ifndef PSPSKY_STRINGS_H
 #define PSPSKY_STRINGS_H
 
-/* One global for the whole process. PSP-specific detection (sceUtility) happens
-   in main; the core only reads this. Not thread-safe. */
+/* Language selection is global and not thread-safe. */
 typedef enum {
-    PSPSKY_LANG_JA = 0,   /* default */
+    PSPSKY_LANG_JA = 0,  /* default */
     PSPSKY_LANG_EN = 1
 } pspsky_lang_t;
 
@@ -14,12 +12,14 @@ void pspsky_lang_set(pspsky_lang_t lang);
 
 pspsky_lang_t pspsky_lang_get(void);
 
-/* Values and ordering must match the tables in src/core/strings.c.
-   TIME_MIN/HOUR/DAY_AGO, TRC_CONNECT_FAIL/TRC_COMM_FAIL and UI_IMG_MARK_N are
-   printf formats with one %d; ST_FETCHING_IMAGES has two %d; TRC_TLS_HANDSHAKE
-   has one %s; the rest have no specifiers. */
+/*
+ * Each ID needs an entry in both language tables in src/core/strings.c.
+ * TIME_SEC/MIN/HOUR/DAY/MONTH_AGO, TRC_CONNECT_FAIL/TRC_COMM_FAIL and
+ * UI_IMG_MARK_N are printf formats with one %d; ST_FETCHING_IMAGES has two %d;
+ * TRC_TLS_HANDSHAKE, UI_REPOSTED_BY and UI_REPLIED_TO have one %s; the rest
+ * have no specifiers.
+ */
 typedef enum {
-    /* --- A. error.c: pspsky_strerror --- */
     PSPSKY_STR_ERR_OK = 0,
     PSPSKY_STR_ERR_ARG,
     PSPSKY_STR_ERR_NOMEM,
@@ -35,22 +35,38 @@ typedef enum {
     PSPSKY_STR_ERR_CANCELLED,
     PSPSKY_STR_ERR_RATELIMIT,
     PSPSKY_STR_ERR_UNKNOWN,
-    /* --- B. timeutil.c: relative time --- */
+
     PSPSKY_STR_TIME_JUST_NOW,
+    PSPSKY_STR_TIME_SEC_AGO,
     PSPSKY_STR_TIME_MIN_AGO,
     PSPSKY_STR_TIME_HOUR_AGO,
     PSPSKY_STR_TIME_DAY_AGO,
-    /* --- C. net.c: connection progress --- */
+    PSPSKY_STR_TIME_MONTH_AGO,
+
     PSPSKY_STR_NET_CONNECTING_AP,
     PSPSKY_STR_NET_GETTING_IP,
     PSPSKY_STR_NET_CONNECTED,
-    /* --- D. ui.c --- */
-    PSPSKY_STR_UI_FOOTER_TIMELINE,
-    PSPSKY_STR_UI_FOOTER_PICK,
-    PSPSKY_STR_UI_FOOTER_PREV,
-    PSPSKY_STR_UI_HINT_COMPOSE,
-    PSPSKY_STR_UI_HINT_OK,
-    PSPSKY_STR_UI_HINT_YES_NO,
+
+    PSPSKY_STR_UI_KEY_REFRESH,
+    PSPSKY_STR_UI_KEY_MORE,
+    PSPSKY_STR_UI_KEY_POST,
+    PSPSKY_STR_UI_KEY_QUIT,
+    PSPSKY_STR_UI_KEY_OK,
+    PSPSKY_STR_UI_KEY_YES,
+    PSPSKY_STR_UI_KEY_NO,
+    PSPSKY_STR_UI_KEY_POST_IMAGE,
+    PSPSKY_STR_UI_KEY_CANCEL,
+    PSPSKY_STR_UI_KEY_SELECT,
+    PSPSKY_STR_UI_KEY_POST_THIS,
+    PSPSKY_STR_UI_KEY_RECHOOSE,
+
+    PSPSKY_STR_UI_TAB_FOLLOWING,
+    PSPSKY_STR_UI_REPOSTED_BY,
+    PSPSKY_STR_UI_REPOSTED_BY_YOU,
+    PSPSKY_STR_UI_REPLIED_TO,
+    PSPSKY_STR_UI_REPLIED_TO_YOU,
+    PSPSKY_STR_UI_REPLIED_TO_POST,
+    PSPSKY_STR_UI_REPLIED_TO_BLOCKED,
     PSPSKY_STR_UI_EMBED_MARK,
     PSPSKY_STR_UI_IMG_MARK_N,
     PSPSKY_STR_UI_PREV_TITLE,
@@ -61,7 +77,7 @@ typedef enum {
     PSPSKY_STR_UI_TL_EMPTY,
     PSPSKY_STR_UI_MSG_PATH_TOO_LONG,
     PSPSKY_STR_UI_MSG_DIR_OPEN_FAIL,
-    /* --- E. main.c --- */
+
     PSPSKY_STR_CACERT_NOT_FOUND,
     PSPSKY_STR_CACERT_UNREADABLE,
     PSPSKY_STR_CA_DIAG_PREFIX,
@@ -93,7 +109,7 @@ typedef enum {
     PSPSKY_STR_CONFIRM_QUIT,
     PSPSKY_STR_MSG_SESSION_EXPIRED_RELOGIN,
     PSPSKY_STR_CONFIRM_ABORT_QUIT,
-    /* --- F. transport_curl.c: errmsg --- */
+
     PSPSKY_STR_TRC_CACERT_READ_PRE,
     PSPSKY_STR_TRC_PATH_UNSET,
     PSPSKY_STR_TRC_CERT_VERIFY,
@@ -105,11 +121,13 @@ typedef enum {
     PSPSKY_STR_COUNT
 } pspsky_str_id_t;
 
-/* Static UTF-8 in the current language. The same (language, id) always yields
-   the same pointer, so callers may compare pointers to suppress duplicates. */
+/*
+ * Static UTF-8 in the current language. The same (language, id) always yields
+ * the same pointer, so callers may compare pointers to suppress duplicates.
+ */
 const char *pspsky_tr(pspsky_str_id_t id);
 
-/* Language-pinned lookup, for tests and timeutil's _ja/_en entry points */
+/* Use lang without changing the global language. */
 const char *pspsky_tr_lang(pspsky_lang_t lang, pspsky_str_id_t id);
 
 #endif /* PSPSKY_STRINGS_H */

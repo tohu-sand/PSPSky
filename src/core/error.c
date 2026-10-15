@@ -1,5 +1,3 @@
-/* Error code to localized message. Wording lives in src/core/strings.c. */
-
 #include "pspsky/error.h"
 #include "pspsky/strings.h"
 
