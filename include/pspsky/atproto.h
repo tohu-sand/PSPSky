@@ -105,7 +105,7 @@ int pspsky_atp_get_timeline(const pspsky_transport_t *t,
                             const char *cursor,
                             pspsky_timeline_t *out,
                             char *errmsg);
-/* Equivalent to create_post_ex with image = NULL. */
+/* Equivalent to create_post_ex with images = NULL and image_count = 0. */
 int pspsky_atp_create_post(const pspsky_transport_t *t,
                            const pspsky_session_t *sess,
                            const char *text_utf8,
@@ -129,12 +129,16 @@ int pspsky_atp_upload_blob(const pspsky_transport_t *t,
                            pspsky_blob_t *out,
                            char *errmsg);
 
-/* image non-NULL adds record.embed = app.bsky.embed.images with one entry */
+/*
+ * image_count is 0..PSPSKY_MAX_IMAGES; images is required when count > 0.
+ * Adds record.embed = app.bsky.embed.images in array order when count > 0.
+ */
 int pspsky_atp_create_post_ex(const pspsky_transport_t *t,
                               const pspsky_session_t *sess,
                               const char *text_utf8,
                               const char *created_at_iso,
-                              const pspsky_embed_image_t *image,
+                              const pspsky_embed_image_t *images,
+                              int image_count,
                               char *errmsg);
 
 /*
@@ -152,7 +156,7 @@ int pspsky_client_login(pspsky_client_t *c, const pspsky_transport_t *t,
                         const char *identifier, const char *app_password);
 int pspsky_client_get_timeline(pspsky_client_t *c, int limit,
                                const char *cursor, pspsky_timeline_t *out);
-/* Equivalent to create_post_ex with image = NULL. */
+/* Equivalent to create_post_ex with images = NULL and image_count = 0. */
 int pspsky_client_create_post(pspsky_client_t *c, const char *text_utf8,
                               const char *created_at_iso);
 int pspsky_client_upload_blob(pspsky_client_t *c, const unsigned char *data,
@@ -160,6 +164,7 @@ int pspsky_client_upload_blob(pspsky_client_t *c, const unsigned char *data,
                               pspsky_blob_t *out);
 int pspsky_client_create_post_ex(pspsky_client_t *c, const char *text_utf8,
                                  const char *created_at_iso,
-                                 const pspsky_embed_image_t *image);
+                                 const pspsky_embed_image_t *images,
+                                 int image_count);
 
 #endif /* PSPSKY_ATPROTO_H */

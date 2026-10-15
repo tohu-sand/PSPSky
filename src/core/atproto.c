@@ -899,14 +899,12 @@ cleanup:
 }
 
 /* The caller owns the returned tree. Attached children are freed with their parent. */
-static cJSON *build_embed_images(const pspsky_embed_image_t *image)
+static cJSON *build_embed_images(const pspsky_embed_image_t *images,
+                                 int image_count)
 {
-    cJSON *embed  = NULL;
-    cJSON *images = NULL;
-    cJSON *entry  = NULL;
-    cJSON *blob   = NULL;
-    cJSON *ref    = NULL;
-    cJSON *aspect = NULL;
+    cJSON *embed   = NULL;
+    cJSON *entries = NULL;
+    int i;
 
     embed = cJSON_CreateObject();
     if (embed == NULL) {
@@ -916,54 +914,62 @@ static cJSON *build_embed_images(const pspsky_embed_image_t *image)
         goto fail;
     }
 
-    images = cJSON_CreateArray();
-    if (images == NULL || !cJSON_AddItemToObject(embed, "images", images)) {
-        cJSON_Delete(images);
+    entries = cJSON_CreateArray();
+    if (entries == NULL || !cJSON_AddItemToObject(embed, "images", entries)) {
+        cJSON_Delete(entries);
         goto fail;
     }
 
-    entry = cJSON_CreateObject();
-    if (entry == NULL || !cJSON_AddItemToArray(images, entry)) {
-        cJSON_Delete(entry);
-        goto fail;
-    }
+    for (i = 0; i < image_count; ++i) {
+        const pspsky_embed_image_t *image = &images[i];
+        cJSON *entry;
+        cJSON *blob;
+        cJSON *ref;
+        cJSON *aspect;
 
-    /* alt is required, and an empty string is a valid value */
-    if (cJSON_AddStringToObject(entry, "alt", image->alt) == NULL) {
-        goto fail;
-    }
-
-    blob = cJSON_CreateObject();
-    if (blob == NULL || !cJSON_AddItemToObject(entry, "image", blob)) {
-        cJSON_Delete(blob);
-        goto fail;
-    }
-
-    if (cJSON_AddStringToObject(blob, "$type", "blob") == NULL) {
-        goto fail;
-    }
-    ref = cJSON_CreateObject();
-    if (ref == NULL || !cJSON_AddItemToObject(blob, "ref", ref)) {
-        cJSON_Delete(ref);
-        goto fail;
-    }
-
-    if (cJSON_AddStringToObject(ref, "$link", image->blob.cid) == NULL ||
-        cJSON_AddStringToObject(blob, "mimeType", image->blob.mime_type) == NULL ||
-        cJSON_AddNumberToObject(blob, "size", (double)image->blob.size) == NULL) {
-        goto fail;
-    }
-
-    if (image->aspect_w > 0 && image->aspect_h > 0) {
-        aspect = cJSON_CreateObject();
-        if (aspect == NULL || !cJSON_AddItemToObject(entry, "aspectRatio", aspect)) {
-            cJSON_Delete(aspect);
+        entry = cJSON_CreateObject();
+        if (entry == NULL || !cJSON_AddItemToArray(entries, entry)) {
+            cJSON_Delete(entry);
             goto fail;
         }
 
-        if (cJSON_AddNumberToObject(aspect, "width", (double)image->aspect_w) == NULL ||
-            cJSON_AddNumberToObject(aspect, "height", (double)image->aspect_h) == NULL) {
+        /* alt is required, and an empty string is a valid value */
+        if (cJSON_AddStringToObject(entry, "alt", image->alt) == NULL) {
             goto fail;
+        }
+
+        blob = cJSON_CreateObject();
+        if (blob == NULL || !cJSON_AddItemToObject(entry, "image", blob)) {
+            cJSON_Delete(blob);
+            goto fail;
+        }
+
+        if (cJSON_AddStringToObject(blob, "$type", "blob") == NULL) {
+            goto fail;
+        }
+        ref = cJSON_CreateObject();
+        if (ref == NULL || !cJSON_AddItemToObject(blob, "ref", ref)) {
+            cJSON_Delete(ref);
+            goto fail;
+        }
+
+        if (cJSON_AddStringToObject(ref, "$link", image->blob.cid) == NULL ||
+            cJSON_AddStringToObject(blob, "mimeType", image->blob.mime_type) == NULL ||
+            cJSON_AddNumberToObject(blob, "size", (double)image->blob.size) == NULL) {
+            goto fail;
+        }
+
+        if (image->aspect_w > 0 && image->aspect_h > 0) {
+            aspect = cJSON_CreateObject();
+            if (aspect == NULL || !cJSON_AddItemToObject(entry, "aspectRatio", aspect)) {
+                cJSON_Delete(aspect);
+                goto fail;
+            }
+
+            if (cJSON_AddNumberToObject(aspect, "width", (double)image->aspect_w) == NULL ||
+                cJSON_AddNumberToObject(aspect, "height", (double)image->aspect_h) == NULL) {
+                goto fail;
+            }
         }
     }
 
@@ -978,7 +984,8 @@ static int atp_create_post_impl(const pspsky_transport_t *t,
                                 const pspsky_session_t *sess,
                                 const char *text_utf8,
                                 const char *created_at_iso,
-                                const pspsky_embed_image_t *image,
+                                const pspsky_embed_image_t *images,
+                                int image_count,
                                 char *errmsg,
                                 int *status)
 {
@@ -988,6 +995,7 @@ static int atp_create_post_impl(const pspsky_transport_t *t,
     char   isobuf[32];
     const char *iso;
     int rc;
+    int i;
 
     if (errmsg != NULL) {
         errmsg[0] = '\0';
@@ -1001,8 +1009,14 @@ static int atp_create_post_impl(const pspsky_transport_t *t,
     if (text_utf8 == NULL || text_utf8[0] == '\0') {
         return PSPSKY_E_ARG;
     }
-    if (image != NULL && image->blob.cid[0] == '\0') {
+    if (image_count < 0 || image_count > PSPSKY_MAX_IMAGES ||
+        (image_count > 0 && images == NULL)) {
         return PSPSKY_E_ARG;
+    }
+    for (i = 0; i < image_count; ++i) {
+        if (images[i].blob.cid[0] == '\0') {
+            return PSPSKY_E_ARG;
+        }
     }
 
     iso = created_at_iso;
@@ -1043,8 +1057,8 @@ static int atp_create_post_impl(const pspsky_transport_t *t,
         goto cleanup;
     }
 
-    if (image != NULL) {
-        cJSON *embed = build_embed_images(image);
+    if (image_count > 0) {
+        cJSON *embed = build_embed_images(images, image_count);
 
         if (embed == NULL || !cJSON_AddItemToObject(record, "embed", embed)) {
             cJSON_Delete(embed);
@@ -1202,7 +1216,7 @@ int pspsky_atp_create_post(const pspsky_transport_t *t,
                            const char *created_at_iso,
                            char *errmsg)
 {
-    return pspsky_atp_create_post_ex(t, sess, text_utf8, created_at_iso, NULL,
+    return pspsky_atp_create_post_ex(t, sess, text_utf8, created_at_iso, NULL, 0,
                                      errmsg);
 }
 
@@ -1210,12 +1224,13 @@ int pspsky_atp_create_post_ex(const pspsky_transport_t *t,
                               const pspsky_session_t *sess,
                               const char *text_utf8,
                               const char *created_at_iso,
-                              const pspsky_embed_image_t *image,
+                              const pspsky_embed_image_t *images,
+                              int image_count,
                               char *errmsg)
 {
     int status = 0;
-    return atp_create_post_impl(t, sess, text_utf8, created_at_iso, image,
-                                errmsg, &status);
+    return atp_create_post_impl(t, sess, text_utf8, created_at_iso, images,
+                                image_count, errmsg, &status);
 }
 
 /* Public CDN requests do not use authentication or session refresh. */
@@ -1379,12 +1394,13 @@ int pspsky_client_get_timeline(pspsky_client_t *c, int limit,
 int pspsky_client_create_post(pspsky_client_t *c, const char *text_utf8,
                               const char *created_at_iso)
 {
-    return pspsky_client_create_post_ex(c, text_utf8, created_at_iso, NULL);
+    return pspsky_client_create_post_ex(c, text_utf8, created_at_iso, NULL, 0);
 }
 
 int pspsky_client_create_post_ex(pspsky_client_t *c, const char *text_utf8,
                                  const char *created_at_iso,
-                                 const pspsky_embed_image_t *image)
+                                 const pspsky_embed_image_t *images,
+                                 int image_count)
 {
     char errmsg[PSPSKY_ERRMSG_MAX];
     int status = 0;
@@ -1400,7 +1416,7 @@ int pspsky_client_create_post_ex(pspsky_client_t *c, const char *text_utf8,
 
     errmsg[0] = '\0';
     rc = atp_create_post_impl(c->transport, &c->session, text_utf8,
-                              created_at_iso, image, errmsg, &status);
+                              created_at_iso, images, image_count, errmsg, &status);
     if (rc == PSPSKY_E_AUTH_EXPIRED) {
         if (!client_try_refresh(c, &rc, errmsg, &status)) {
             client_record(c, rc, status, errmsg);
@@ -1409,7 +1425,7 @@ int pspsky_client_create_post_ex(pspsky_client_t *c, const char *text_utf8,
         errmsg[0] = '\0';
         status = 0;
         rc = atp_create_post_impl(c->transport, &c->session, text_utf8,
-                                  created_at_iso, image, errmsg, &status);
+                                  created_at_iso, images, image_count, errmsg, &status);
     }
 
     client_record(c, rc, status, errmsg);
