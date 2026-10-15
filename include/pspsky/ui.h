@@ -16,7 +16,8 @@ typedef enum {
 typedef enum {
     PSPSKY_UI_COMPOSE_CANCEL          = 0,  /* Cross */
     PSPSKY_UI_COMPOSE_POST            = 1,  /* Circle */
-    PSPSKY_UI_COMPOSE_POST_WITH_IMAGE = 2  /* Square */
+    PSPSKY_UI_COMPOSE_POST_WITH_IMAGE = 2,  /* Square: add an image */
+    PSPSKY_UI_COMPOSE_REMOVE_IMAGE    = 3  /* Triangle: remove the last image */
 } pspsky_ui_compose_choice_t;
 
 #define PSPSKY_UI_PICK_PATH_MAX 512
@@ -68,8 +69,9 @@ void pspsky_ui_message(const char *msg_utf8);
 /* Blocks; returns 1 for Circle, 0 for Cross. */
 int  pspsky_ui_confirm(const char *msg_utf8);
 
-/* Blocks until a compose action is selected. */
-pspsky_ui_compose_choice_t pspsky_ui_compose_confirm(const char *msg_utf8);
+/* Blocks until a compose action is selected; shows up to PSPSKY_MAX_IMAGES. */
+pspsky_ui_compose_choice_t pspsky_ui_compose_confirm(
+    const char *msg_utf8, const char *const *image_paths, int image_count);
 
 /*
  * Blocking browser for directories and JPEG/PNG files, rooted at "ms0:/".

@@ -1600,6 +1600,92 @@ static void ui_draw_status(const char *msg_utf8)
     }
 }
 
+static void ui_draw_compose_buttons(int y, const ui_button_t *buttons, int count)
+{
+    float width = 0.0f;
+    float x;
+    int   i;
+
+    for (i = 0; i < count; i++) {
+        width += ui_button_w(&buttons[i]) + ((i > 0) ? UI_BTN_GAP : 0);
+    }
+    x = ((float)UI_SCR_W - width) * 0.5f;
+    for (i = 0; i < count; i++) {
+        ui_draw_button(x, y, UI_BTN_H, &buttons[i], UI_COL_BORDER);
+        x += ui_button_w(&buttons[i]) + UI_BTN_GAP;
+    }
+}
+
+static void ui_draw_compose_dialog(const char *msg_utf8,
+                                   const char *const *image_paths,
+                                   int image_count)
+{
+    static const ui_button_t actions[] = {
+        { UI_ICON_CIRCLE, PSPSKY_STR_UI_KEY_POST,   1 },
+        { UI_ICON_CROSS,  PSPSKY_STR_UI_KEY_CANCEL, 0 }
+    };
+    static const ui_button_t attachments[] = {
+        { UI_ICON_SQUARE,   PSPSKY_STR_UI_KEY_POST_IMAGE,   0 },
+        { UI_ICON_TRIANGLE, PSPSKY_STR_UI_KEY_REMOVE_IMAGE, 0 }
+    };
+    const char *msg = (msg_utf8 != NULL) ? msg_utf8 : "";
+    int lines = ui_wrap(msg, UI_SIZE_MSG, UI_MSG_W);
+    int fixed_h = 2 * UI_DLG_PAD + 8 + (image_count + 1) * UI_LINE_H +
+                  12 + 2 * UI_BTN_H + 6;
+    int max_lines = (UI_SCR_H - 16 - fixed_h) / UI_LINE_H;
+    int card_x = (UI_SCR_W - UI_DLG_MAX_W) / 2;
+    int card_h, card_y, y, i;
+    int first_attachment = (image_count == PSPSKY_MAX_IMAGES) ? 1 : 0;
+    int attachment_actions = (image_count > 0 ? 2 : 1) - first_attachment;
+    char buf[PSPSKY_UI_PICK_PATH_MAX + 4];
+
+    /* Keep the count, every filename and both control rows visible. */
+    if (lines > max_lines) {
+        lines = max_lines;
+    }
+    card_h = fixed_h + lines * UI_LINE_H;
+    card_y = (UI_SCR_H - card_h) / 2;
+    ui_fill_rrect(card_x, card_y, UI_DLG_MAX_W, card_h,
+                  UI_DLG_RADIUS, UI_COL_BORDER);
+    ui_fill_rrect(card_x + 1, card_y + 1, UI_DLG_MAX_W - 2, card_h - 2,
+                  UI_DLG_RADIUS - 1, UI_COL_CARD);
+
+    y = card_y + UI_DLG_PAD;
+    for (i = 0; i < lines; i++) {
+        ui_text(UI_SIZE_MSG, UI_COL_TEXT, (float)(card_x + UI_DLG_PAD),
+                (float)(y + UI_BASELINE), ui_wrap_line(msg, i));
+        y += UI_LINE_H;
+    }
+    y += 8;
+    snprintf(buf, sizeof buf, pspsky_tr(PSPSKY_STR_UI_COMPOSE_IMAGES),
+             image_count, PSPSKY_MAX_IMAGES);
+    ui_text_bold(UI_SIZE_SMALL, UI_COL_LINK, (float)(card_x + UI_DLG_PAD),
+                 (float)(y + UI_BASELINE), buf);
+    y += UI_LINE_H;
+    for (i = 0; i < image_count; i++) {
+        const char *path = (image_paths != NULL && image_paths[i] != NULL)
+                          ? image_paths[i] : "";
+        const char *name = strrchr(path, '/');
+        ui_fit_cache_t fit;
+
+        name = (name != NULL) ? name + 1 : path;
+        snprintf(buf, sizeof buf, "%d.", i + 1);
+        ui_text(UI_SIZE_SMALL, UI_COL_MED, (float)(card_x + UI_DLG_PAD),
+                (float)(y + UI_BASELINE), buf);
+        ui_fit_head_calc(name, UI_SIZE_SMALL,
+                         (float)(UI_DLG_MAX_W - 2 * UI_DLG_PAD - 24),
+                         sizeof buf, &fit);
+        ui_text(UI_SIZE_SMALL, UI_COL_TEXT,
+                (float)(card_x + UI_DLG_PAD + 24), (float)(y + UI_BASELINE),
+                ui_fit_head_apply(name, &fit, buf, sizeof buf));
+        y += UI_LINE_H;
+    }
+    y += 12;
+    ui_draw_compose_buttons(y, actions, 2);
+    ui_draw_compose_buttons(y + UI_BTN_H + 6,
+                            &attachments[first_attachment], attachment_actions);
+}
+
 static int ui_pick_has_suffix(const char *name, const char *suffix)
 {
     size_t n = strlen(name);
@@ -2245,24 +2331,25 @@ int pspsky_ui_confirm(const char *msg_utf8)
     }
 }
 
-pspsky_ui_compose_choice_t pspsky_ui_compose_confirm(const char *msg_utf8)
+pspsky_ui_compose_choice_t pspsky_ui_compose_confirm(
+    const char *msg_utf8, const char *const *image_paths, int image_count)
 {
-    static const ui_button_t choices[] = {
-        { UI_ICON_CIRCLE, PSPSKY_STR_UI_KEY_POST,       1 },
-        { UI_ICON_SQUARE, PSPSKY_STR_UI_KEY_POST_IMAGE, 0 },
-        { UI_ICON_CROSS,  PSPSKY_STR_UI_KEY_CANCEL,     0 }
-    };
     SceCtrlData pad;
     int         first = 1;
 
     if (!s_inited) {
         return PSPSKY_UI_COMPOSE_CANCEL;
     }
+    if (image_count < 0) {
+        image_count = 0;
+    } else if (image_count > PSPSKY_MAX_IMAGES) {
+        image_count = PSPSKY_MAX_IMAGES;
+    }
     for (;;) {
         unsigned int pressed;
 
         ui_frame_begin();
-        ui_draw_dialog(msg_utf8, 1, choices, 3);
+        ui_draw_compose_dialog(msg_utf8, image_paths, image_count);
         ui_frame_end();
 
         memset(&pad, 0, sizeof(pad));
@@ -2278,8 +2365,11 @@ pspsky_ui_compose_choice_t pspsky_ui_compose_confirm(const char *msg_utf8)
         if (pressed & PSP_CTRL_CIRCLE) {
             return PSPSKY_UI_COMPOSE_POST;
         }
-        if (pressed & PSP_CTRL_SQUARE) {
+        if ((pressed & PSP_CTRL_SQUARE) && image_count < PSPSKY_MAX_IMAGES) {
             return PSPSKY_UI_COMPOSE_POST_WITH_IMAGE;
+        }
+        if ((pressed & PSP_CTRL_TRIANGLE) && image_count > 0) {
+            return PSPSKY_UI_COMPOSE_REMOVE_IMAGE;
         }
         if (pressed & PSP_CTRL_CROSS) {
             return PSPSKY_UI_COMPOSE_CANCEL;

@@ -10,7 +10,7 @@ A [Bluesky](https://bsky.app) client for the PSP (PlayStation Portable). It conn
 
 - Read the home timeline: up to 100 posts and four images per post.
 - Write text posts of up to 300 characters, with Japanese input support.
-- Attach one JPEG or PNG per post, up to 2,000,000 bytes, with optional ALT text.
+- Attach up to four JPEG or PNG images per post, up to 2,000,000 bytes each, with optional ALT text for each image.
 
 Quote post and link card contents are not displayed.
 
@@ -70,9 +70,9 @@ Do not use spaces around `=` or quotes around values. The order of lines does no
 | ↑ / ↓, analog stick | Scroll. Hold the D-pad or tilt the stick further to scroll faster |
 | L | Refresh the timeline |
 | R, or ↓ at the bottom | Load older posts, up to 100 in total |
-| △ | Compose a post |
+| △ | Compose a post. On the confirmation screen, remove the last attachment |
 | ○ | Confirm |
-| □ | Attach an image on the post confirmation screen |
+| □ | Add an image on the post confirmation screen (up to four) |
 | × | Cancel. On the image preview screen, choose another file |
 | START | Quit |
 
@@ -86,14 +86,18 @@ Do not use spaces around `=` or quotes around values. The order of lines does no
 | ○ | Accept the candidate |
 | START | Finish input and proceed to the confirmation screen |
 
-### Attaching an image
+### Attaching images
 
 1. Enter the post text and press □ on the confirmation screen.
 2. Select a JPEG or PNG in the file browser.
 3. Check the image, file size, and dimensions in the preview, then press ○.
-4. Enter optional ALT text (an image description) and submit the post.
+4. Enter optional ALT text (an image description) for that image.
+5. Press □ on the confirmation screen to add another image, up to four. Check the attachment count and filenames; press △ to remove the last image if needed.
+6. Press ○ to upload the images in the selected order and submit the post.
 
-The controls may be unresponsive for up to 180 seconds during an upload. Wait for it to finish before turning off the PSP.
+Pressing × in the file browser returns to confirmation with the text and earlier attachments intact. Pressing × on the confirmation screen cancels the entire post.
+
+The controls may be unresponsive for up to 180 seconds per image during an upload. The screen shows which image is being uploaded. Wait for it to finish before turning off the PSP.
 
 ## Building
 

@@ -767,12 +767,12 @@ static int compose_now_iso(char *iso, size_t cap)
 }
 
 static int compose_send(const char *text, const char *iso,
-                        const pspsky_embed_image_t *img)
+                        const pspsky_embed_image_t *images, int image_count)
 {
     int rc;
 
     pspsky_ui_status(pspsky_tr(PSPSKY_STR_ST_POSTING));
-    rc = pspsky_client_create_post_ex(&g_client, text, iso, img);
+    rc = pspsky_client_create_post_ex(&g_client, text, iso, images, image_count);
     if (rc != PSPSKY_OK) {
         return rc;
     }
@@ -876,16 +876,14 @@ static int pick_and_load_image(char *path_out, size_t path_cap,
     }
 }
 
-/* APP_COMPOSE_BACK returns to the confirm screen with the text intact. */
-static int app_compose_with_image(const char *text)
+/* Select one attachment without uploading; cancellation keeps the draft intact. */
+static int app_compose_add_image(char *img_path, size_t path_cap,
+                                 pspsky_embed_image_t *img)
 {
-    static pspsky_embed_image_t img;
     static char    alt_raw[APP_TEXT_BUF];
-    static char    img_path[PSPSKY_UI_PICK_PATH_MAX];
     unsigned char *buf  = NULL;
     size_t         len  = 0;
     const char    *mime = NULL;
-    char           iso[32];
     int            w    = 0;
     int            h    = 0;
     int            is_png;
@@ -899,7 +897,7 @@ static int app_compose_with_image(const char *text)
         int            sh    = 0;
         int            ok;
 
-        if (pick_and_load_image(img_path, sizeof(img_path),
+        if (pick_and_load_image(img_path, path_cap,
                                 &buf, &len, &mime) != PSPSKY_OK) {
             return APP_COMPOSE_BACK;
         }
@@ -952,9 +950,10 @@ static int app_compose_with_image(const char *text)
         buf = NULL;
     }
 
-    memset(&img, 0, sizeof(img));
-    img.aspect_w = w;
-    img.aspect_h = h;
+    free(buf);
+    memset(img, 0, sizeof(*img));
+    img->aspect_w = w;
+    img->aspect_h = h;
 
     /* Collect alt text before upload: blobs can expire before createRecord. */
     alt_raw[0] = '\0';
@@ -962,30 +961,81 @@ static int app_compose_with_image(const char *text)
                          APP_POST_MAX_CHARS,
                          alt_raw, sizeof(alt_raw)) == PSPSKY_OK) {
         pspsky_utf8_truncate(alt_raw, PSPSKY_MAX_ALT - 1);
-        snprintf(img.alt, sizeof(img.alt), "%s", alt_raw);
+        snprintf(img->alt, sizeof(img->alt), "%s", alt_raw);
     }
+    return PSPSKY_OK;
+}
 
-    /* Keep buf alive through upload and any authentication retry; curl borrows it. */
-    pspsky_ui_status(pspsky_tr(PSPSKY_STR_ST_UPLOADING));
-    rc = pspsky_client_upload_blob(&g_client, buf, len, mime, &img.blob);
-    free(buf);
-    buf = NULL;
-    if (rc != PSPSKY_OK) {
-        return rc;
-    }
+/* Reopen each file at send time so four attachments need only one file buffer. */
+static int app_compose_upload_images(const char *const *paths,
+                                     pspsky_embed_image_t *images, int count)
+{
+    int i;
 
-    /* createdAt is taken after the upload, which can take minutes. */
-    if (!compose_now_iso(iso, sizeof(iso))) {
-        return APP_COMPOSE_BACK;
+    for (i = 0; i < count; i++) {
+        unsigned char *buf = NULL;
+        size_t         len = 0;
+        const char    *mime;
+        char           status[96];
+        int            rc;
+
+        rc = load_image_file(paths[i], &buf, &len);
+        if (rc != PSPSKY_OK) {
+            pspsky_ui_message(rc == PSPSKY_E_NOMEM ? pspsky_strerror(rc) :
+                              pspsky_tr(rc == PSPSKY_E_ARG ?
+                                PSPSKY_STR_MSG_IMG_TOO_LARGE :
+                                PSPSKY_STR_MSG_IMG_READ_FAIL));
+            return APP_COMPOSE_BACK;
+        }
+        mime = pspsky_image_sniff_mime(buf, len);
+        if (mime == NULL) {
+            free(buf);
+            pspsky_ui_message(pspsky_tr(PSPSKY_STR_MSG_IMG_UNSUPPORTED));
+            return APP_COMPOSE_BACK;
+        }
+
+        /* Dimensions must describe the actual file if it changed since preview. */
+        if (strcmp(mime, "image/png") == 0) {
+            rc = pspsky_png_dimensions(buf, len,
+                                       &images[i].aspect_w, &images[i].aspect_h);
+        } else {
+            rc = pspsky_jpeg_dimensions(buf, len,
+                                        &images[i].aspect_w, &images[i].aspect_h);
+        }
+        if (rc != PSPSKY_OK) {
+            images[i].aspect_w = 0;
+            images[i].aspect_h = 0;
+        }
+
+        /* curl borrows buf through the upload and any authentication retry. */
+        snprintf(status, sizeof(status), pspsky_tr(PSPSKY_STR_ST_UPLOADING),
+                 i + 1, count);
+        pspsky_ui_status(status);
+        rc = pspsky_client_upload_blob(&g_client, buf, len, mime, &images[i].blob);
+        free(buf);
+        if (rc != PSPSKY_OK) {
+            return rc;
+        }
     }
-    return compose_send(text, iso, &img);
+    return PSPSKY_OK;
 }
 
 static int app_compose(void)
 {
     static char text[APP_TEXT_BUF];
+    static char image_paths[PSPSKY_MAX_IMAGES][PSPSKY_UI_PICK_PATH_MAX];
+    static pspsky_embed_image_t images[PSPSKY_MAX_IMAGES];
+    const char *paths[PSPSKY_MAX_IMAGES];
     char iso[32];
+    int  image_count = 0;
+    int  i;
     int  rc;
+
+    memset(image_paths, 0, sizeof(image_paths));
+    memset(images, 0, sizeof(images));
+    for (i = 0; i < PSPSKY_MAX_IMAGES; i++) {
+        paths[i] = image_paths[i];
+    }
 
     rc = pspsky_osk_input(pspsky_tr(PSPSKY_STR_OSK_COMPOSE), "", APP_POST_MAX_CHARS,
                           text, sizeof(text));
@@ -1005,20 +1055,40 @@ static int app_compose(void)
     }
 
     for (;;) {
-        pspsky_ui_compose_choice_t choice = pspsky_ui_compose_confirm(text);
+        pspsky_ui_compose_choice_t choice =
+            pspsky_ui_compose_confirm(text, paths, image_count);
 
         if (choice == PSPSKY_UI_COMPOSE_POST_WITH_IMAGE) {
-            rc = app_compose_with_image(text);
+            if (image_count < PSPSKY_MAX_IMAGES &&
+                app_compose_add_image(image_paths[image_count],
+                                       sizeof(image_paths[image_count]),
+                                       &images[image_count]) == PSPSKY_OK) {
+                image_count++;
+            }
+            continue;
+        }
+        if (choice == PSPSKY_UI_COMPOSE_REMOVE_IMAGE) {
+            if (image_count > 0) {
+                image_count--;
+                image_paths[image_count][0] = '\0';
+                memset(&images[image_count], 0, sizeof(images[image_count]));
+            }
+            continue;
+        }
+        if (choice == PSPSKY_UI_COMPOSE_POST) {
+            rc = app_compose_upload_images(paths, images, image_count);
             if (rc == APP_COMPOSE_BACK) {
                 continue;
             }
-            return rc;
-        }
-        if (choice == PSPSKY_UI_COMPOSE_POST) {
-            if (!compose_now_iso(iso, sizeof(iso))) {
-                return PSPSKY_OK;
+            if (rc != PSPSKY_OK) {
+                return rc;
             }
-            return compose_send(text, iso, NULL);
+            /* Timestamp after all uploads, which can take several minutes. */
+            if (!compose_now_iso(iso, sizeof(iso))) {
+                continue;
+            }
+            return compose_send(text, iso, image_count > 0 ? images : NULL,
+                                image_count);
         }
         return PSPSKY_OK;
     }

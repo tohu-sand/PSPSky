@@ -78,13 +78,15 @@ static const char *const k_ja[PSPSKY_STR_COUNT] = {
     [PSPSKY_STR_UI_KEY_NO] =
         "いいえ",
     [PSPSKY_STR_UI_KEY_POST_IMAGE] =
-        "画像を付けて投稿",
+        "画像を追加",
+    [PSPSKY_STR_UI_KEY_REMOVE_IMAGE] =
+        "最後を削除",
     [PSPSKY_STR_UI_KEY_CANCEL] =
         "キャンセル",
     [PSPSKY_STR_UI_KEY_SELECT] =
         "決定",
     [PSPSKY_STR_UI_KEY_POST_THIS] =
-        "この画像で投稿",
+        "この画像を追加",
     [PSPSKY_STR_UI_KEY_RECHOOSE] =
         "選び直す",
     [PSPSKY_STR_UI_TAB_FOLLOWING] =
@@ -105,6 +107,8 @@ static const char *const k_ja[PSPSKY_STR_COUNT] = {
         "画像",
     [PSPSKY_STR_UI_IMG_MARK_N] =
         "画像 %d枚",
+    [PSPSKY_STR_UI_COMPOSE_IMAGES] =
+        "添付画像 %d/%d枚",
     [PSPSKY_STR_UI_PREV_TITLE] =
         "画像プレビュー",
     [PSPSKY_STR_UI_PREV_NO_IMAGE] =
@@ -143,7 +147,7 @@ static const char *const k_ja[PSPSKY_STR_COUNT] = {
     [PSPSKY_STR_ST_POSTING] =
         "投稿中...",
     [PSPSKY_STR_ST_UPLOADING] =
-        "画像をアップロード中...",
+        "画像をアップロード中 (%d/%d)...",
     [PSPSKY_STR_ST_PREVIEW_PREP] =
         "プレビューを準備中...",
     [PSPSKY_STR_OSK_HANDLE] =
@@ -268,13 +272,15 @@ static const char *const k_en[PSPSKY_STR_COUNT] = {
     [PSPSKY_STR_UI_KEY_NO] =
         "No",
     [PSPSKY_STR_UI_KEY_POST_IMAGE] =
-        "Post with image",
+        "Add image",
+    [PSPSKY_STR_UI_KEY_REMOVE_IMAGE] =
+        "Remove last",
     [PSPSKY_STR_UI_KEY_CANCEL] =
         "Cancel",
     [PSPSKY_STR_UI_KEY_SELECT] =
         "Select",
     [PSPSKY_STR_UI_KEY_POST_THIS] =
-        "Post this image",
+        "Attach image",
     [PSPSKY_STR_UI_KEY_RECHOOSE] =
         "Choose again",
     [PSPSKY_STR_UI_TAB_FOLLOWING] =
@@ -295,6 +301,8 @@ static const char *const k_en[PSPSKY_STR_COUNT] = {
         "Image",
     [PSPSKY_STR_UI_IMG_MARK_N] =
         "%d images",
+    [PSPSKY_STR_UI_COMPOSE_IMAGES] =
+        "Images %d/%d",
     [PSPSKY_STR_UI_PREV_TITLE] =
         "Image preview",
     [PSPSKY_STR_UI_PREV_NO_IMAGE] =
@@ -333,7 +341,7 @@ static const char *const k_en[PSPSKY_STR_COUNT] = {
     [PSPSKY_STR_ST_POSTING] =
         "Posting...",
     [PSPSKY_STR_ST_UPLOADING] =
-        "Uploading image...",
+        "Uploading image (%d/%d)...",
     [PSPSKY_STR_ST_PREVIEW_PREP] =
         "Preparing preview...",
     [PSPSKY_STR_OSK_HANDLE] =

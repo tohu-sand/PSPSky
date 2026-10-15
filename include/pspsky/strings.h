@@ -15,9 +15,9 @@ pspsky_lang_t pspsky_lang_get(void);
 /*
  * Each ID needs an entry in both language tables in src/core/strings.c.
  * TIME_SEC/MIN/HOUR/DAY/MONTH_AGO, TRC_CONNECT_FAIL/TRC_COMM_FAIL and
- * UI_IMG_MARK_N are printf formats with one %d; ST_FETCHING_IMAGES has two %d;
- * TRC_TLS_HANDSHAKE, UI_REPOSTED_BY and UI_REPLIED_TO have one %s; the rest
- * have no specifiers.
+ * UI_IMG_MARK_N are printf formats with one %d; ST_FETCHING_IMAGES,
+ * ST_UPLOADING and UI_COMPOSE_IMAGES have two %d; TRC_TLS_HANDSHAKE,
+ * UI_REPOSTED_BY and UI_REPLIED_TO have one %s; the rest have no specifiers.
  */
 typedef enum {
     PSPSKY_STR_ERR_OK = 0,
@@ -55,6 +55,7 @@ typedef enum {
     PSPSKY_STR_UI_KEY_YES,
     PSPSKY_STR_UI_KEY_NO,
     PSPSKY_STR_UI_KEY_POST_IMAGE,
+    PSPSKY_STR_UI_KEY_REMOVE_IMAGE,
     PSPSKY_STR_UI_KEY_CANCEL,
     PSPSKY_STR_UI_KEY_SELECT,
     PSPSKY_STR_UI_KEY_POST_THIS,
@@ -69,6 +70,7 @@ typedef enum {
     PSPSKY_STR_UI_REPLIED_TO_BLOCKED,
     PSPSKY_STR_UI_EMBED_MARK,
     PSPSKY_STR_UI_IMG_MARK_N,
+    PSPSKY_STR_UI_COMPOSE_IMAGES,
     PSPSKY_STR_UI_PREV_TITLE,
     PSPSKY_STR_UI_PREV_NO_IMAGE,
     PSPSKY_STR_UI_PREV_NO_IMAGE_SUB,
