@@ -1,9 +1,4 @@
-/* WebP thumbnail decoding on top of the vendored libwebp decoder.
- *
- * libwebp rescales while it decodes, so the scaled RGB888 lands straight in the
- * caller's buffer (is_external_memory) and no full-resolution image is ever
- * held; the PSP's memory limits make that mandatory. No globals: reentrant.
- */
+/* Decode directly into the scaled output buffer to stay within PSP memory limits. */
 
 #include "pspsky/webp.h"
 
@@ -14,10 +9,8 @@
 #include <stddef.h>
 #include <string.h>
 
-/* Sources wider or taller than this are refused before any decoding starts */
 #define WEBP_THUMB_MAX_SRC_DIM 4096
 
-/* Maps a libwebp status onto the shared error codes */
 static int webp_thumb_map_status(VP8StatusCode st)
 {
     if (st == VP8_STATUS_OK) {
@@ -29,7 +22,7 @@ static int webp_thumb_map_status(VP8StatusCode st)
     return PSPSKY_E_PARSE;
 }
 
-/* Largest box within max_w x max_h that keeps the aspect ratio; integer only */
+/* Fit without upscaling and preserve the aspect ratio. */
 static void webp_thumb_fit(int src_w, int src_h, int max_w, int max_h,
                            int *out_w, int *out_h)
 {
@@ -42,9 +35,8 @@ static void webp_thumb_fit(int src_w, int src_h, int max_w, int max_h,
         return;
     }
 
-    /* Compare src_w/src_h against max_w/max_h by cross-multiplication */
     if (src_w * max_h >= src_h * max_w) {
-        w = max_w;                        /* width is the binding constraint */
+        w = max_w;
         h = (src_h * max_w) / src_w;
     } else {
         h = max_h;
@@ -113,7 +105,7 @@ int pspsky_webp_thumb_decode(const unsigned char *webp, size_t webp_len,
 
     memset(&config, 0, sizeof config);
     if (!WebPInitDecoderConfig(&config)) {
-        return PSPSKY_E_PARSE; /* header/library ABI mismatch */
+        return PSPSKY_E_PARSE;  /* header/library ABI mismatch */
     }
 
     st = WebPGetFeatures(webp, webp_len, &config.input);
@@ -124,7 +116,7 @@ int pspsky_webp_thumb_decode(const unsigned char *webp, size_t webp_len,
     src_w = config.input.width;
     src_h = config.input.height;
     if (config.input.has_animation) {
-        return PSPSKY_E_PARSE; /* only single still frames are supported */
+        return PSPSKY_E_PARSE;
     }
     if (src_w < 1 || src_h < 1 ||
         src_w > WEBP_THUMB_MAX_SRC_DIM || src_h > WEBP_THUMB_MAX_SRC_DIM) {

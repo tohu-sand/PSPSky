@@ -1,8 +1,6 @@
-/* JPEG 1/8-scale thumbnail decoding via picojpeg's reduce mode, where each 8x8
- * block yields one pixel from its DC coefficient.
- *
- * NOT REENTRANT: picojpeg keeps a single global context, so only one decode may
- * be in flight at a time. PSPSky calls it from a single thread.
+/*
+ * picojpeg reduce mode yields one pixel per 8x8 block.
+ * Its global decoder context permits only one decode at a time.
  */
 
 #include "pspsky/jpeg.h"
@@ -14,15 +12,13 @@
 #include <stddef.h>
 #include <string.h>
 
-/* Input stream handed to picojpeg's read callback */
 typedef struct {
     const unsigned char *p;
     size_t len;
-    size_t ofs;             /* next byte to return */
+    size_t ofs;  /* next byte to return */
 } thumb_src_t;
 
-/* Refills picojpeg's buffer. Reporting a read error at 0 bytes remaining is
-   what stops truncated data from looping forever. */
+/* Return an error at EOF; picojpeg can otherwise loop on truncated input. */
 static unsigned char thumb_need_bytes(unsigned char *pBuf,
                                       unsigned char buf_size,
                                       unsigned char *pBytes_actually_read,
@@ -38,7 +34,7 @@ static unsigned char thumb_need_bytes(unsigned char *pBuf,
 
     remain = ctx->len - ctx->ofs;
     if (remain == 0) {
-        return PJPG_STREAM_READ_ERROR; /* not enough data */
+        return PJPG_STREAM_READ_ERROR;
     }
 
     n = (size_t)buf_size;
@@ -72,12 +68,11 @@ int pspsky_jpeg_thumb_decode(const unsigned char *jpeg, size_t jpeg_len,
     unsigned char status;
     int thumb_w;
     int thumb_h;
-    int row_blocks; /* horizontal blocks per MCU (1 or 2) */
-    int col_blocks; /* vertical blocks per MCU (1 or 2) */
+    int row_blocks;  /* horizontal blocks per MCU (1 or 2) */
+    int col_blocks;  /* vertical blocks per MCU (1 or 2) */
     int mcu_x = 0;
     int mcu_y = 0;
 
-    /* 1. Validate arguments */
     if (out_thumb_w != NULL) {
         *out_thumb_w = 0;
     }
@@ -97,7 +92,7 @@ int pspsky_jpeg_thumb_decode(const unsigned char *jpeg, size_t jpeg_len,
         return PSPSKY_E_ARG;
     }
 
-    /* 2. Init with reduce=1; progressive JPEGs are rejected here */
+    /* reduce=1 enables 1/8 scale; progressive JPEGs are unsupported. */
     ctx.p = jpeg;
     ctx.len = jpeg_len;
     ctx.ofs = 0;
@@ -111,7 +106,6 @@ int pspsky_jpeg_thumb_decode(const unsigned char *jpeg, size_t jpeg_len,
         return PSPSKY_E_PARSE;
     }
 
-    /* 3. Thumbnail dimensions and output capacity */
     thumb_w = (info.m_width + 7) / 8;
     thumb_h = (info.m_height + 7) / 8;
     if (thumb_w > PSPSKY_JPEG_THUMB_MAX_DIM ||
@@ -125,7 +119,6 @@ int pspsky_jpeg_thumb_decode(const unsigned char *jpeg, size_t jpeg_len,
     row_blocks = info.m_MCUWidth >> 3;
     col_blocks = info.m_MCUHeight >> 3;
 
-    /* 4. MCU loop, row by row from the top left */
     for (;;) {
         int bx;
         int by;
@@ -140,13 +133,14 @@ int pspsky_jpeg_thumb_decode(const unsigned char *jpeg, size_t jpeg_len,
         }
 
         if (mcu_y >= info.m_MCUSPerCol) {
-            /* More MCUs than the decoder declared: corrupt data */
             thumb_zero_out(out_thumb_w, out_thumb_h, out_src_w, out_src_h);
             return PSPSKY_E_PARSE;
         }
 
-        /* 5. In reduce mode only each block's first pixel is valid, and block
-              (bx, by) lives at byte offset by*128 + bx*64 */
+        /*
+         * Reduce mode exposes only the first pixel of each block,
+         * at byte offset by * 128 + bx * 64.
+         */
         for (by = 0; by < col_blocks; by++) {
             for (bx = 0; bx < row_blocks; bx++) {
                 size_t src_ofs = (size_t)by * 128u + (size_t)bx * 64u;
@@ -154,7 +148,7 @@ int pspsky_jpeg_thumb_decode(const unsigned char *jpeg, size_t jpeg_len,
                 int ty = mcu_y * col_blocks + by;
                 unsigned char *dst;
 
-                /* 6. Drop MCU padding */
+                /* Exclude MCU padding outside the image. */
                 if (tx >= thumb_w || ty >= thumb_h) {
                     continue;
                 }
@@ -162,7 +156,6 @@ int pspsky_jpeg_thumb_decode(const unsigned char *jpeg, size_t jpeg_len,
                 dst = out_rgb + ((size_t)ty * (size_t)thumb_w + (size_t)tx) * 3u;
 
                 if (info.m_scanType == PJPG_GRAYSCALE) {
-                    /* Grayscale MCUs are 8x8, one pixel; R=G=B */
                     dst[0] = info.m_pMCUBufR[0];
                     dst[1] = info.m_pMCUBufR[0];
                     dst[2] = info.m_pMCUBufR[0];
@@ -181,13 +174,12 @@ int pspsky_jpeg_thumb_decode(const unsigned char *jpeg, size_t jpeg_len,
         }
     }
 
-    /* If not every MCU was consumed, parts of the output are unwritten: corrupt data */
+    /* Incomplete MCU output must not be displayed. */
     if (mcu_y < info.m_MCUSPerCol) {
         thumb_zero_out(out_thumb_w, out_thumb_h, out_src_w, out_src_h);
         return PSPSKY_E_PARSE;
     }
 
-    /* 7. Success */
     *out_thumb_w = thumb_w;
     *out_thumb_h = thumb_h;
     *out_src_w = info.m_width;

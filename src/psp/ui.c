@@ -1,12 +1,3 @@
-/*
- * PSPSky - UI on sceGu + intraFont. Drawing and pad input only, no networking.
- *
- * intraFont constraints: it returns with GU_DEPTH_TEST enabled, so the depth
- * func must be GU_ALWAYS; it skips rebinding its texture while
- * INTRAFONT_ACTIVE, so call intraFontActivate after binding your own; and
- * sprites drawn after it need 32BITF vertices.
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +6,7 @@
 #include <pspdisplay.h>
 #include <pspgu.h>
 #include <pspiofilemgr.h>
-#include <psputils.h>   /* sceKernelDcacheWritebackRange */
+#include <psputils.h>
 
 #include <intraFont.h>
 
@@ -25,104 +16,135 @@
 #include "pspsky/ui.h"
 #include "pspsky/utf8.h"
 
-/* ------------------------------------------------------------------ */
-/* Screen and layout constants                                         */
-/* ------------------------------------------------------------------ */
+#include "ui_atlas.h"
 
 #define UI_SCR_W        480
 #define UI_SCR_H        272
 #define UI_BUF_W        512
-#define UI_FRAME_SIZE   (UI_BUF_W * UI_SCR_H * 4)   /* GU_PSM_8888 */
+#define UI_FRAME_SIZE   (UI_BUF_W * UI_SCR_H * 4)  /* GU_PSM_8888 */
 
-#define UI_HEADER_H     20                          /* header: y=0..19    */
-#define UI_LIST_TOP     20                          /* list:   y=20..251  */
-#define UI_LIST_BOTTOM  252
-#define UI_LIST_H       (UI_LIST_BOTTOM - UI_LIST_TOP)
-#define UI_FOOTER_Y     252                         /* footer: y=252..271 */
-#define UI_FOOTER_H     (UI_SCR_H - UI_FOOTER_Y)
+/*
+ * Timeline content extends under the sliding bars; padding keeps posts clear
+ * when the bars are visible.
+ */
+#define UI_HEADER_H     24  /* bottom border included */
+#define UI_FOOTER_H     22  /* top border included */
+#define UI_FOOTER_Y     (UI_SCR_H - UI_FOOTER_H)
+#define UI_PAD_TOP      UI_HEADER_H
+#define UI_PAD_BOTTOM   UI_FOOTER_H
 
-#define UI_MARGIN_X     10
-#define UI_BODY_W       460.0f                      /* body wrap width    */
+#define UI_AVATAR_X     10
+#define UI_AVATAR_PX    PSPSKY_UI_AVATAR_PX
+#define UI_CONTENT_X    (UI_AVATAR_X + UI_AVATAR_PX + 8)
+#define UI_CONTENT_W    (UI_SCR_W - UI_CONTENT_X - 12)
+#define UI_POST_PAD_T   7
+#define UI_POST_PAD_B   8
+#define UI_META_H       17  /* name, handle, relative time */
+#define UI_META_BASE    13  /* baseline offset */
+#define UI_CTX_H        15  /* repost/reply line */
+#define UI_CTX_BASE     11
+#define UI_CTX_ICON     12
 #define UI_LINE_H       16
-#define UI_BASELINE     12                          /* line top to baseline */
-/* Timestamp gets its own line: a long handle would overlap it in the header. */
-#define UI_TIME_LINE_H  13                          /* timestamp line height */
-#define UI_TIME_BASELINE 10                         /* timestamp top to baseline */
-#define UI_POST_PAD     6                           /* bottom padding + separator */
-#define UI_TL_IMG_GAP   4                           /* body to thumbnail gap */
-#define UI_SCROLL_STEP  8                           /* scroll amount per frame */
-#define UI_ANALOG_DEAD  48
+#define UI_BASELINE     12
+#define UI_DOT_GAP      4  /* gap on each side of the time separator */
+#define UI_DOT_PX       3
+#define UI_TL_IMG_GAP   5
+#define UI_IMG_RADIUS   6
+#define UI_CHIP_H       20  /* fallback image marker */
+#define UI_END_H        36  /* load-more row */
 
-#define UI_SIZE_HEADER  0.70f
+#define UI_SCROLL_STEP  8
+#define UI_SCROLL_FAST  16
+#define UI_SCROLL_HOLD  30  /* frames before fast scrolling */
+#define UI_ANALOG_DEAD  48  /* dead zone for stick drift */
+#define UI_ANALOG_MAX   18  /* pixels per frame at full tilt */
+
+#define UI_SIZE_TAB     0.75f
 #define UI_SIZE_NAME    0.75f
 #define UI_SIZE_BODY    0.80f
-#define UI_SIZE_FOOTER  0.60f
+#define UI_SIZE_SMALL   0.65f
+#define UI_SIZE_KEY     0.55f
 #define UI_SIZE_MSG     0.80f
 
-/* GU colours are 0xAABBGGRR */
-#define UI_COL_BG       0xFF201510
-#define UI_COL_BAR      0xFF3A2A20
-#define UI_COL_TEXT     0xFFF0F0F0
-#define UI_COL_NAME     0xFFE8E8FF
-#define UI_COL_LINK     0xFFFFB058   /* link facet in the body (sky blue)    */
-#define UI_COL_DIM      0xFF9C9C9C
-#define UI_COL_SEP      0xFF4A3A30
-#define UI_COL_TRACK    0xFF3A2A20
-#define UI_COL_KNOB     0xFF9C8C80
-#define UI_COL_BOX      0xE0301F18
-/* The cursor row needs bar + dark text + ">" to be visible on the PSP LCD. */
-#define UI_COL_SEL      0xFFF0A050   /* cursor row bar (bright sky blue)     */
-#define UI_COL_SEL_TEXT 0xFF201510   /* cursor row text (dark, matches bg)   */
+/* GU colors use 0xAABBGGRR. */
+#define UI_RGB(r, g, b) \
+    (0xFF000000u | ((unsigned int)(b) << 16) | ((unsigned int)(g) << 8) | \
+     (unsigned int)(r))
 
-/* Internal limits */
-#define UI_MAX_LAYOUT_POSTS 128   /* main caps the timeline at 100 posts */
+/* Bluesky dim theme: inverted subdued palette from @bsky.app/alf. */
+#define UI_COL_BG       UI_RGB(0x15, 0x1D, 0x28)  /* contrast_0 */
+#define UI_COL_CARD     UI_RGB(0x1C, 0x27, 0x36)  /* contrast_25 */
+#define UI_COL_BORDER   UI_RGB(0x2C, 0x3A, 0x4E)  /* contrast_100 */
+#define UI_COL_KEYCAP   UI_RGB(0x39, 0x49, 0x60)  /* contrast_200 */
+#define UI_COL_KNOB     UI_RGB(0x48, 0x5B, 0x75)  /* contrast_300 */
+#define UI_COL_TEXT     UI_RGB(0xFF, 0xFF, 0xFF)  /* contrast_1000 */
+#define UI_COL_MED      UI_RGB(0xAB, 0xB8, 0xC9)  /* text_contrast_medium */
+#define UI_COL_PRIMARY  UI_RGB(0x0F, 0x73, 0xFF)  /* primary_500 */
+#define UI_COL_LINK     UI_RGB(0x4D, 0x97, 0xFF)  /* text_link (primary_600) */
+#define UI_COL_AVATAR   UI_RGB(0x00, 0x70, 0xFF)
+/* Combine a bright bar, dark text and ">" for contrast on the PSP LCD. */
+#define UI_COL_SEL      UI_COL_LINK
+#define UI_COL_SEL_TEXT UI_COL_BG
+
+#define UI_MAX_LAYOUT_POSTS 128  /* must cover the timeline limit in main */
 #define UI_WRAP_MAX_LINES   64
-/* Post header buffers. ui_fit_head_calc() and ui_fit_head_apply() must be
-   handed the same cap for a given string, so the sizes are named here rather
-   than spelled out at each call site. */
-#define UI_NAME_BUF         (PSPSKY_MAX_HANDLE + 8)    /* fitted name        */
-#define UI_HSRC_BUF         (PSPSKY_MAX_HANDLE + 8)    /* " @handle" source  */
-#define UI_HANDLE_BUF       (PSPSKY_MAX_HANDLE + 16)   /* fitted " @handle"  */
-#define UI_MSG_W            400.0f
-#define UI_GU_LIST_WORDS    32768 /* 128KB: intraFont allocates via sceGuGetMemory */
+/* ui_fit_head_calc() and ui_fit_head_apply() must use the same capacity. */
+#define UI_NAME_BUF         (PSPSKY_MAX_HANDLE + 8)
+#define UI_HSRC_BUF         (PSPSKY_MAX_HANDLE + 8)  /* source with leading " @" */
+#define UI_HANDLE_BUF       (PSPSKY_MAX_HANDLE + 16)
+#define UI_CTX_BUF          (PSPSKY_MAX_DISPLAYNAME + 64)
+#define UI_GU_LIST_WORDS    32768  /* 128 KiB; also holds intraFont vertices */
 
-/* File browser */
+#define UI_MSG_W            396.0f
+#define UI_DLG_PAD          16
+#define UI_DLG_MIN_W        220
+#define UI_DLG_MAX_W        440
+#define UI_DLG_RADIUS       10
+#define UI_DLG_MAX_LINES    11  /* fits within the screen */
+#define UI_BTN_H            20
+#define UI_BAR_BTN_H        18
+#define UI_BTN_GAP          8
+
 #define UI_PICK_MAX_ENTRIES  200
 #define UI_PICK_NAME_MAX     128
-#define UI_PICK_ROWS         (UI_LIST_H / UI_LINE_H)  /* 14 rows */
-#define UI_PICK_REPEAT_DELAY 20   /* frames held before repeat starts */
-#define UI_PICK_REPEAT_RATE  4    /* frames between repeats */
+#define UI_PICK_ROW_H        18
+#define UI_PICK_TOP          (UI_HEADER_H + 2)
+#define UI_PICK_ROWS         ((UI_FOOTER_Y - UI_PICK_TOP) / UI_PICK_ROW_H)
+#define UI_PICK_NAME_X       40
+#define UI_PICK_NAME_W       (UI_SCR_W - UI_PICK_NAME_X - 12)
+#define UI_PICK_FIT_BUF      (UI_PICK_NAME_MAX + 4)  /* name + UTF-8 ellipsis + NUL */
+#define UI_PICK_REPEAT_DELAY 20  /* frames before repeat */
+#define UI_PICK_REPEAT_RATE  4  /* frames between repeats */
 
-/* Timeline thumbnail textures: 4 slots of 256x128 (power of two), 512KB */
-#define UI_TL_TEX_SLOTS   4
+/*
+ * Twelve 256x128 textures use 1.5 MiB. Interior image rows need at least 38 px
+ * per texture; two partially visible edge rows need at most four textures. At
+ * most floor(272/38) + 4 = 11 textures are visible. Current-frame slots stay
+ * pinned.
+ */
+#define UI_TL_TEX_SLOTS   12
 #define UI_TL_TEX_W       256
 #define UI_TL_TEX_H       128
 
-/* Image preview screen */
-#define UI_PREV_MAX_DIM   512     /* max texture side (power of two)    */
-#define UI_PREV_MIN_DIM   16      /* min texture side (power of two)    */
-#define UI_PREV_AREA_Y    24      /* top of the image area              */
-#define UI_PREV_AREA_W    440     /* max width of the image area        */
-#define UI_PREV_AREA_H    164     /* max height of the image area       */
-#define UI_PREV_INFO_Y1   196     /* top of info line 1 (path)          */
-#define UI_PREV_INFO_Y2   212     /* top of info line 2 (size, dims)    */
-#define UI_PREV_INFO_W    460.0f  /* max width of an info line          */
+/* Sixteen avatars cover one screen and use 64 KiB. */
+#define UI_AV_SLOTS       16
 
-/* Footer and hint texts come from the language table. */
-#define UI_FOOTER_TEXT      pspsky_tr(PSPSKY_STR_UI_FOOTER_TIMELINE)
-#define UI_PICK_FOOTER_TEXT pspsky_tr(PSPSKY_STR_UI_FOOTER_PICK)
-#define UI_COMPOSE_HINT     pspsky_tr(PSPSKY_STR_UI_HINT_COMPOSE)
-#define UI_EMBED_MARK       pspsky_tr(PSPSKY_STR_UI_EMBED_MARK)
+#define UI_PREV_MAX_DIM   512  /* power-of-two texture limits */
+#define UI_PREV_MIN_DIM   16
+#define UI_PREV_AREA_Y    32
+#define UI_PREV_AREA_W    440
+#define UI_PREV_AREA_H    170
+#define UI_PREV_INFO_Y1   210  /* path */
+#define UI_PREV_INFO_Y2   228  /* file size and dimensions */
+#define UI_PREV_INFO_W    460.0f
+#define UI_PREV_RADIUS    8
+
 #define UI_PICK_CURSOR      ">"
 #define UI_PREV_TITLE       pspsky_tr(PSPSKY_STR_UI_PREV_TITLE)
-#define UI_PREV_FOOTER_TEXT pspsky_tr(PSPSKY_STR_UI_FOOTER_PREV)
 #define UI_PREV_NO_IMAGE    pspsky_tr(PSPSKY_STR_UI_PREV_NO_IMAGE)
 #define UI_PREV_NO_IMAGE_SUB pspsky_tr(PSPSKY_STR_UI_PREV_NO_IMAGE_SUB)
+#define UI_EMBED_MARK       pspsky_tr(PSPSKY_STR_UI_EMBED_MARK)
 #define UI_IMG_MARK_N_FMT   pspsky_tr(PSPSKY_STR_UI_IMG_MARK_N)
-
-/* ------------------------------------------------------------------ */
-/* Internal state                                                      */
-/* ------------------------------------------------------------------ */
 
 static unsigned int __attribute__((aligned(16))) s_gu_list[UI_GU_LIST_WORDS];
 
@@ -131,85 +153,132 @@ static int          s_inited      = 0;
 
 static unsigned int s_prev_buttons = 0;
 
-static int          s_scroll       = 0;   /* scroll offset in pixels */
+/*
+ * Track texture bindings because intraFont skips rebinding while
+ * INTRAFONT_ACTIVE. Reset each frame.
+ */
+enum { UI_TEX_NONE = 0, UI_TEX_FONT, UI_TEX_ATLAS, UI_TEX_OTHER };
+static int          s_tex          = UI_TEX_NONE;
+static unsigned int s_frame        = 0;
+
+static int          s_scroll       = 0;  /* scroll offset in pixels */
+static int          s_shell        = 0;  /* 0 = bars visible, UI_HEADER_H = hidden */
+static int          s_hold         = 0;
+static int          s_vis_top      = 0;  /* visible list bounds for the current frame */
+static int          s_vis_bottom   = UI_SCR_H;
 static int          s_layout_valid = 0;
 static int          s_layout_count = 0;
-static int          s_content_h    = 0;
+static int          s_layout_more  = 0;  /* has_more used to build the layout */
+static int          s_content_h    = 0;  /* posts and end row, excluding padding */
 static int          s_post_top[UI_MAX_LAYOUT_POSTS + 1];
+static float        s_digit_w      = 0.0f;  /* space reserved for an extra time digit */
 
-/* Wrap result (byte offset and length); shared, not reentrant. */
+/* Shared UTF-8 byte offsets and lengths; not reentrant. */
 static int  s_wrap_start[UI_WRAP_MAX_LINES];
 static int  s_wrap_len[UI_WRAP_MAX_LINES];
 static char s_line_buf[PSPSKY_MAX_TEXT + 1];
 
-/* Per-post layout cache, filled by ui_rebuild_layout() and read by
-   ui_draw_post(). It exists so the timeline draw path never calls
-   intraFontMeasureText: on hardware, re-wrapping every visible post one code
-   point at a time on every frame is what made deep scrolling crawl. Valid
-   exactly while s_layout_valid is set, for the first s_layout_count posts, so
-   it is invalidated by pspsky_ui_timeline_invalidate() along with s_post_top.
-   Same semantics as s_wrap_start/s_wrap_len: byte offset into post->text and
-   byte length, both well under a short (PSPSKY_MAX_TEXT is 1024). 32KB. */
+/*
+ * Cache wrapped byte offsets and lengths (32 KiB) to avoid measuring every
+ * code point each frame. Valid for s_layout_count posts while s_layout_valid
+ * is set. PSPSKY_MAX_TEXT must fit in a short.
+ */
 static short s_pw_start[UI_MAX_LAYOUT_POSTS][UI_WRAP_MAX_LINES];
 static short s_pw_len[UI_MAX_LAYOUT_POSTS][UI_WRAP_MAX_LINES];
 
-/* A ui_fit_head() result kept as "copy this many bytes of the source, then
-   maybe an ellipsis" instead of as the fitted string. Rebuilding from it is a
-   memcpy, and it costs 4 bytes per string instead of a 264-byte buffer. */
+/* Store truncation offsets to limit per-post memory use. */
 typedef struct {
-    short cut;   /* bytes of the source kept */
-    short ell;   /* 1 = the ellipsis follows */
+    short cut;  /* source bytes retained */
+    short ell;  /* append an ellipsis */
 } ui_fit_cache_t;
 
 typedef struct {
-    ui_fit_cache_t name;       /* display name (or handle), truncated  */
-    ui_fit_cache_t handle;     /* " @handle", truncated                */
-    short          lines;      /* wrapped body line count              */
-    short          has_handle; /* 1 = the @handle is drawn at all      */
-    float          handle_x;   /* pen x for the @handle                */
+    ui_fit_cache_t name;
+    ui_fit_cache_t handle;
+    ui_fit_cache_t repost;
+    ui_fit_cache_t reply;
+    short         lines;
+    short         has_handle;
+    float         handle_x;
+    float         time_x;  /* start of the time separator */
+    float         time_room;  /* width reserved for relative time */
 } ui_post_cache_t;
 
 static ui_post_cache_t s_post_cache[UI_MAX_LAYOUT_POSTS];
 
-/* About 26KB, so kept off the stack. */
 typedef struct {
-    char name[UI_PICK_NAME_MAX];
-    int  is_dir;
+    char           name[UI_PICK_NAME_MAX];
+    int            is_dir;
+    ui_fit_cache_t fit;
 } ui_pick_entry_t;
 
+/* Keep the directory listing (~27 KiB) off the stack. */
 static ui_pick_entry_t s_pick[UI_PICK_MAX_ENTRIES];
 static int             s_pick_count  = 0;
-static int             s_pick_parent = 0;  /* 1 = entry 0 is a synthetic ".." */
+static int             s_pick_parent = 0;  /* entry 0 is a synthetic ".." */
 static char            s_pick_cur[PSPSKY_UI_PICK_PATH_MAX];
-static char            s_pick_path[PSPSKY_UI_PICK_PATH_MAX]; /* build scratch */
+static char            s_pick_path[PSPSKY_UI_PICK_PATH_MAX];
 
-/* Preview texture, 512x512 GU_PSM_8888 = 1MB; valid region is the top-left. */
+/* 1 MiB preview texture; image data occupies the top-left region. */
 static unsigned int __attribute__((aligned(64)))
     s_prev_tex[UI_PREV_MAX_DIM * UI_PREV_MAX_DIM];
 
-/* Timeline thumbnail textures, 512KB, filled on a slot miss only. s_tl_tex_post
-   maps a slot to the post index it holds (-1 = empty); those indices and the
-   rgb buffers behind them belong to main, so every slot is dropped by
-   pspsky_ui_timeline_invalidate() before main is free to release them. */
+/*
+ * Slots are keyed by post/image index (-1 post = empty). Invalidate before
+ * main changes indices or frees RGB buffers. Referenced slots stay pinned
+ * until the GU frame completes.
+ */
 static unsigned int __attribute__((aligned(16)))
     s_tl_tex[UI_TL_TEX_SLOTS][UI_TL_TEX_W * UI_TL_TEX_H];
-static int s_tl_tex_post[UI_TL_TEX_SLOTS] = { -1, -1, -1, -1 };
-static int s_tl_tex_next = 0;   /* round robin */
+static int s_tl_tex_post[UI_TL_TEX_SLOTS];
+static int s_tl_tex_image[UI_TL_TEX_SLOTS];
+static unsigned char s_tl_tex_pinned[UI_TL_TEX_SLOTS];
+static int s_tl_tex_next = 0;  /* round robin */
+
+/* LRU cache keyed by main-owned RGB buffers; invalidated with thumbnails. */
+static unsigned int __attribute__((aligned(16)))
+    s_av_tex[UI_AV_SLOTS][UI_AVATAR_PX * UI_AVATAR_PX];
+static const unsigned char *s_av_key[UI_AV_SLOTS];  /* NULL = empty */
+static unsigned int         s_av_used[UI_AV_SLOTS];  /* s_frame of the last draw */
+
+/* 64 KiB atlas: white RGB with mask coverage in alpha for GU_TFX_MODULATE. */
+static unsigned int __attribute__((aligned(16)))
+    s_atlas[UI_ATLAS_W * UI_ATLAS_H];
+
+/* Coverage of a thumbnail's top-left corner; the others are mirrored. */
+static unsigned char s_corner_a[UI_IMG_RADIUS][UI_IMG_RADIUS];
 
 typedef struct {
     unsigned int color;
     short x, y, z;
 } ui_vertex_t;
 
-/* Textured sprite vertex; UVs are texels. Float, see ui_prev_draw_image(). */
+/*
+ * UVs are texels. Textured sprites after intraFont require 32BITF vertices
+ * on hardware.
+ */
 typedef struct {
     float u, v;
     float x, y, z;
 } ui_tex_vertex_f_t;
 
-/* ------------------------------------------------------------------ */
-/* Drawing primitives                                                  */
-/* ------------------------------------------------------------------ */
+typedef struct {
+    float        u, v;
+    unsigned int color;
+    float        x, y, z;
+} ui_tc_vertex_t;
+
+/* Source coordinates are texels; destination coordinates are pixels. */
+typedef struct {
+    float u0, v0, u1, v1;
+    float x0, y0, x1, y1;
+} ui_quad_t;
+
+typedef struct {
+    int             glyph;  /* UI_ICON_TRIANGLE / CIRCLE / CROSS / SQUARE */
+    pspsky_str_id_t label;
+    int             primary;  /* filled with the primary color */
+} ui_button_t;
 
 static void ui_draw_rect(int x, int y, int w, int h, unsigned int color)
 {
@@ -231,13 +300,137 @@ static void ui_draw_rect(int x, int y, int w, int h, unsigned int color)
     v[1].y = (short)(y + h);
     v[1].z = 0;
 
-    /* intraFontPrint returns with GU_DEPTH_TEST enabled. */
+    /* intraFont re-enables depth testing. */
     sceGuDisable(GU_DEPTH_TEST);
     sceGuDisable(GU_TEXTURE_2D);
     sceGuDrawArray(GU_SPRITES,
                    GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
                    2, 0, v);
     sceGuEnable(GU_TEXTURE_2D);
+}
+
+static void ui_atlas_bind(void)
+{
+    /* intraFont re-enables depth testing. */
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuEnable(GU_TEXTURE_2D);
+    if (s_tex == UI_TEX_ATLAS) {
+        return;
+    }
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, UI_ATLAS_W, UI_ATLAS_H, UI_ATLAS_W, s_atlas);
+    sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
+    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    s_tex = UI_TEX_ATLAS;
+}
+
+static void ui_atlas_draw(const ui_quad_t *q, int n, unsigned int color)
+{
+    ui_tc_vertex_t *v;
+    int             i;
+
+    if (n <= 0) {
+        return;
+    }
+    v = (ui_tc_vertex_t *)sceGuGetMemory((unsigned int)n * 2u * sizeof *v);
+    if (!v) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        v[2 * i].u         = q[i].u0;
+        v[2 * i].v         = q[i].v0;
+        v[2 * i].color     = color;
+        v[2 * i].x         = q[i].x0;
+        v[2 * i].y         = q[i].y0;
+        v[2 * i].z         = 0.0f;
+        v[2 * i + 1].u     = q[i].u1;
+        v[2 * i + 1].v     = q[i].v1;
+        v[2 * i + 1].color = color;
+        v[2 * i + 1].x     = q[i].x1;
+        v[2 * i + 1].y     = q[i].y1;
+        v[2 * i + 1].z     = 0.0f;
+    }
+    ui_atlas_bind();
+    sceGuDrawArray(GU_SPRITES,
+                   GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF |
+                   GU_TRANSFORM_2D,
+                   n * 2, 0, v);
+}
+
+static void ui_icon_scaled(int icon, float x, float y, float w, float h,
+                           unsigned int color)
+{
+    const unsigned char *r = k_ui_icon_rect[icon];
+    ui_quad_t q;
+
+    q.u0 = (float)r[0];
+    q.v0 = (float)r[1];
+    q.u1 = (float)(r[0] + r[2]);
+    q.v1 = (float)(r[1] + r[3]);
+    q.x0 = x;
+    q.y0 = y;
+    q.x1 = x + w;
+    q.y1 = y + h;
+    ui_atlas_draw(&q, 1, color);
+}
+
+static void ui_icon(int icon, int x, int y, unsigned int color)
+{
+    const unsigned char *r = k_ui_icon_rect[icon];
+
+    ui_icon_scaled(icon, (float)x, (float)y, (float)r[2], (float)r[3], color);
+}
+
+static void ui_corners(int icon, int x, int y, int w, int h, int r,
+                       unsigned int color)
+{
+    const unsigned char *c = k_ui_icon_rect[icon];
+    float     u0 = (float)c[0];
+    float     v0 = (float)c[1];
+    float     um = (float)c[0] + (float)c[2] * 0.5f;
+    float     vm = (float)c[1] + (float)c[3] * 0.5f;
+    float     u1 = (float)(c[0] + c[2]);
+    float     v1 = (float)(c[1] + c[3]);
+    ui_quad_t q[4];
+    int       i;
+
+    for (i = 0; i < 4; i++) {
+        int right  = i & 1;
+        int bottom = i >> 1;
+        int dx     = right ? x + w - r : x;
+        int dy     = bottom ? y + h - r : y;
+
+        q[i].u0 = right ? um : u0;
+        q[i].u1 = right ? u1 : um;
+        q[i].v0 = bottom ? vm : v0;
+        q[i].v1 = bottom ? v1 : vm;
+        q[i].x0 = (float)dx;
+        q[i].y0 = (float)dy;
+        q[i].x1 = (float)(dx + r);
+        q[i].y1 = (float)(dy + r);
+    }
+    ui_atlas_draw(q, 4, color);
+}
+
+/* Keep pieces disjoint so translucent colors blend evenly. */
+static void ui_fill_rrect(int x, int y, int w, int h, int r, unsigned int color)
+{
+    if (r > h / 2) {
+        r = h / 2;
+    }
+    if (r > w / 2) {
+        r = w / 2;
+    }
+    if (r <= 0) {
+        ui_draw_rect(x, y, w, h, color);
+        return;
+    }
+    ui_draw_rect(x + r, y, w - 2 * r, h, color);
+    ui_draw_rect(x, y + r, r, h - 2 * r, color);
+    ui_draw_rect(x + w - r, y + r, r, h - 2 * r, color);
+    ui_corners((r <= 8) ? UI_ICON_CIRCLE16 : UI_ICON_CIRCLE32,
+               x, y, w, h, r, color);
 }
 
 static float ui_measure(float size, const char *s)
@@ -254,8 +447,25 @@ static float ui_text(float size, unsigned int color, float x, float y, const cha
     if (!s_font || !s || !*s) {
         return x;
     }
+    if (s_tex != UI_TEX_FONT) {
+        intraFontActivate(s_font);
+        s_tex = UI_TEX_FONT;
+    }
     intraFontSetStyle(s_font, size, color, 0, 0.0f, 0);
     return intraFontPrint(s_font, x, y, s);
+}
+
+/* jpn0.pgf has no bold face; the offset pass adds one pixel to the width. */
+static float ui_text_bold(float size, unsigned int color, float x, float y,
+                          const char *s)
+{
+    ui_text(size, color, x + 1.0f, y, s);
+    return ui_text(size, color, x, y, s) + 1.0f;
+}
+
+static float ui_measure_bold(float size, const char *s)
+{
+    return (s != NULL && *s != '\0') ? ui_measure(size, s) + 1.0f : 0.0f;
 }
 
 static void ui_frame_begin(void)
@@ -264,6 +474,10 @@ static void ui_frame_begin(void)
     sceGuClearColor(UI_COL_BG);
     sceGuClearDepth(0);
     sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+    s_tex = UI_TEX_NONE;
+    /* ui_frame_end() waits for the GE before these slots are reused. */
+    memset(s_tl_tex_pinned, 0, sizeof s_tl_tex_pinned);
+    s_frame++;
 }
 
 static void ui_frame_end(void)
@@ -274,10 +488,6 @@ static void ui_frame_end(void)
     sceGuSwapBuffers();
 }
 
-/* ------------------------------------------------------------------ */
-/* Word wrap (per code point)                                          */
-/* ------------------------------------------------------------------ */
-
 static void ui_wrap_emit(int *n, int start, int len)
 {
     if (*n < UI_WRAP_MAX_LINES) {
@@ -287,7 +497,7 @@ static void ui_wrap_emit(int *n, int start, int len)
     }
 }
 
-/* Wraps into s_wrap_start[]/s_wrap_len[] and returns the line count. */
+/* Writes byte ranges to the shared wrap buffers; returns the line count. */
 static int ui_wrap(const char *text, float size, float max_w)
 {
     const char *base = text;
@@ -295,8 +505,8 @@ static int ui_wrap(const char *text, float size, float max_w)
     int   nlines     = 0;
     int   line_start = 0;
     float line_w     = 0.0f;
-    int   sp_char    = -1;   /* offset of the last space seen */
-    int   sp_next    = -1;   /* offset just past that space   */
+    int   sp_char    = -1;  /* byte offset of the last space */
+    int   sp_next    = -1;  /* byte offset after that space */
     char  cbuf[8];
 
     if (!s_font || !text) {
@@ -338,7 +548,6 @@ static int ui_wrap(const char *text, float size, float max_w)
 
         if (line_w + cw > max_w && (int)(cp_start - base) > line_start) {
             if (sp_char > line_start) {
-                /* Break at the space, dropping the space itself. */
                 ui_wrap_emit(&nlines, line_start, sp_char - line_start);
                 line_start = sp_next;
             } else {
@@ -349,7 +558,7 @@ static int ui_wrap(const char *text, float size, float max_w)
             line_w  = 0.0f;
             sp_char = -1;
             sp_next = -1;
-            continue;   /* reprocess this character on the next line */
+            continue;
         }
 
         line_w += cw;
@@ -361,7 +570,6 @@ static int ui_wrap(const char *text, float size, float max_w)
     return nlines;
 }
 
-/* Copies text[start .. start+len) into a NUL-terminated buffer. */
 static const char *ui_copy_line(const char *text, int start, int len)
 {
     if (len > (int)sizeof(s_line_buf) - 1) {
@@ -374,22 +582,17 @@ static const char *ui_copy_line(const char *text, int start, int len)
     return s_line_buf;
 }
 
-/* Copies wrapped line i into a NUL-terminated buffer. */
 static const char *ui_wrap_line(const char *text, int i)
 {
     return ui_copy_line(text, s_wrap_start[i], s_wrap_len[i]);
 }
 
-/* ------------------------------------------------------------------ */
-/* Head-first truncation                                               */
-/* ------------------------------------------------------------------ */
+static const char ui_ell[] = "…";  /* UTF-8: three bytes plus NUL */
 
-static const char ui_ell[] = "…";   /* sizeof is 4, NUL included */
-
-/* Works out how src has to be cut to fit into max_w px when the tail is
-   dropped and an ellipsis appended. This is the measuring half of the old
-   ui_fit_head(); it runs at layout time only, and ui_fit_head_apply() rebuilds
-   the string from the result without touching the font. */
+/*
+ * Measure truncation at layout time. ui_fit_head_apply() reconstructs the
+ * string without font calls; both functions must use the same capacity.
+ */
 static void ui_fit_head_calc(const char *src, float size, float max_w,
                              size_t cap, ui_fit_cache_t *out)
 {
@@ -411,12 +614,11 @@ static void ui_fit_head_calc(const char *src, float size, float max_w,
     intraFontSetStyle(s_font, size, UI_COL_TEXT, 0, 0.0f, 0);
     if (strlen(src) < cap && intraFontMeasureText(s_font, src) <= max_w) {
         out->cut = (short)strlen(src);
-        return;   /* fits as-is */
+        return;
     }
 
     avail = max_w - intraFontMeasureText(s_font, ui_ell);
     if (avail < 0.0f) {
-        /* The ellipsis alone does not fit: emit nothing. */
         return;
     }
     for (;;) {
@@ -432,7 +634,7 @@ static void ui_fit_head_calc(const char *src, float size, float max_w,
             break;
         }
         if (used + (size_t)cp_bytes + sizeof ui_ell > cap) {
-            break;   /* always leave room for the ellipsis and the NUL */
+            break;
         }
         memcpy(cbuf, cp_start, (size_t)cp_bytes);
         cbuf[cp_bytes] = '\0';
@@ -447,8 +649,7 @@ static void ui_fit_head_calc(const char *src, float size, float max_w,
     out->ell = (used + sizeof ui_ell <= cap) ? 1 : 0;
 }
 
-/* Rebuilds the string ui_fit_head_calc() described. Pure memcpy: no measuring,
-   so this is what the per-frame draw path calls. */
+/* Reconstruct a cached truncation without measuring text. */
 static const char *ui_fit_head_apply(const char *src, const ui_fit_cache_t *fc,
                                      char *buf, size_t cap)
 {
@@ -460,64 +661,177 @@ static const char *ui_fit_head_apply(const char *src, const ui_fit_cache_t *fc,
     buf[0] = '\0';
     used = (fc->cut > 0) ? (size_t)fc->cut : 0;
     if (src == NULL || used >= cap) {
-        return buf;   /* used >= cap cannot happen: calc() used the same cap */
+        return buf;
     }
     if (used > 0) {
         memcpy(buf, src, used);
     }
     if (fc->ell && used + sizeof ui_ell <= cap) {
-        memcpy(buf + used, ui_ell, sizeof ui_ell);   /* copy including the NUL */
+        memcpy(buf + used, ui_ell, sizeof ui_ell);
     } else {
         buf[used] = '\0';
     }
     return buf;
 }
 
-/* ------------------------------------------------------------------ */
-/* Timeline thumbnails                                                 */
-/* ------------------------------------------------------------------ */
+/* glyph < 0 selects a labeled key cap. Returns the x coordinate after it. */
+static float ui_keycap(float x, int cy, const char *key, int glyph)
+{
+    float w;
 
-/* The thumbnail of post idx, or NULL when it can only be marked as text.
-   Sizes are checked here because a slot holds UI_TL_TEX_W x UI_TL_TEX_H at
-   most, and both the layout and the draw path branch on this result. */
-static const pspsky_ui_tl_image_t *ui_tl_image(const pspsky_ui_timeline_view_t *view,
-                                               int idx)
+    x = (float)(int)(x + 0.5f);  /* whole pixels keep the masks sharp */
+    if (glyph >= 0) {
+        ui_icon_scaled(UI_ICON_CIRCLE16, x, (float)(cy - 7), 14.0f, 14.0f,
+                       UI_COL_KEYCAP);
+        ui_icon(glyph, (int)x + 2, cy - 5, UI_COL_TEXT);
+        return x + 14.0f;
+    }
+    w = (float)(int)(ui_measure(UI_SIZE_KEY, key) + 8.5f);
+    ui_fill_rrect((int)x, cy - 6, (int)w, 13, 3, UI_COL_KEYCAP);
+    ui_text(UI_SIZE_KEY, UI_COL_TEXT, x + 4.0f, (float)(cy + 4), key);
+    return x + w;
+}
+
+static float ui_hint_w(const char *key, int glyph, pspsky_str_id_t label)
+{
+    float cap = (glyph >= 0) ? 14.0f
+                             : (float)(int)(ui_measure(UI_SIZE_KEY, key) + 8.5f);
+
+    return cap + 4.0f + ui_measure(UI_SIZE_SMALL, pspsky_tr(label));
+}
+
+/* Returns the x coordinate after the label. */
+static float ui_hint(float x, int cy, const char *key, int glyph,
+                     pspsky_str_id_t label)
+{
+    x = ui_keycap(x, cy, key, glyph) + 4.0f;
+    return ui_text(UI_SIZE_SMALL, UI_COL_MED, x, (float)(cy + 5),
+                   pspsky_tr(label));
+}
+
+static float ui_button_w(const ui_button_t *b)
+{
+    return (float)(int)(10.0f + 10.0f + 5.0f +
+                        ui_measure_bold(UI_SIZE_SMALL, pspsky_tr(b->label)) +
+                        12.5f);
+}
+
+static void ui_draw_button(float x, int y, int h, const ui_button_t *b,
+                           unsigned int bg)
+{
+    int w  = (int)ui_button_w(b);
+    int cy = y + h / 2;
+
+    x = (float)(int)(x + 0.5f);  /* whole pixels keep the masks sharp */
+    ui_fill_rrect((int)x, y, w, h, h / 2, b->primary ? UI_COL_PRIMARY : bg);
+    ui_icon(b->glyph, (int)x + 10, cy - 5, UI_COL_TEXT);
+    ui_text_bold(UI_SIZE_SMALL, UI_COL_TEXT, x + 25.0f, (float)(cy + 5),
+                 pspsky_tr(b->label));
+}
+
+static void ui_draw_header_bar(int y)
+{
+    ui_draw_rect(0, y, UI_SCR_W, UI_HEADER_H - 1, UI_COL_BG);
+    ui_draw_rect(0, y + UI_HEADER_H - 1, UI_SCR_W, 1, UI_COL_BORDER);
+}
+
+static void ui_draw_footer_bar(int y)
+{
+    ui_draw_rect(0, y, UI_SCR_W, 1, UI_COL_BORDER);
+    ui_draw_rect(0, y + 1, UI_SCR_W, UI_FOOTER_H - 1, UI_COL_BG);
+}
+
+static void ui_draw_footer(int y, const ui_button_t *main_btn,
+                           const char *key, int glyph, pspsky_str_id_t label)
+{
+    int cy = y + 1 + (UI_FOOTER_H - 1) / 2;
+
+    ui_draw_footer_bar(y);
+    if (label != PSPSKY_STR_COUNT) {
+        ui_hint(10.0f, cy, key, glyph, label);
+    }
+    if (main_btn != NULL) {
+        ui_draw_button((float)UI_SCR_W - 10.0f - ui_button_w(main_btn),
+                       cy - UI_BAR_BTN_H / 2, UI_BAR_BTN_H, main_btn,
+                       UI_COL_BORDER);
+    }
+}
+
+static int ui_image_count(const pspsky_post_t *post)
+{
+    if (post->img_count < 0) {
+        return 0;
+    }
+    return (post->img_count > PSPSKY_MAX_IMAGES) ?
+           PSPSKY_MAX_IMAGES : post->img_count;
+}
+
+/* Layout and drawing must use the same image validity checks. */
+static const pspsky_ui_tl_image_t *ui_tl_image(const pspsky_ui_tl_image_t *images,
+                                              int image, int count)
 {
     const pspsky_ui_tl_image_t *img;
+    int max_w = (count > 1) ? PSPSKY_UI_TL_GRID_COL_W : PSPSKY_UI_TL_IMG_MAX_W;
 
-    if (view->images == NULL) {
+    if (images == NULL || image < 0 || image >= count) {
         return NULL;
     }
-    img = &view->images[idx];
+    img = &images[image];
     if (img->rgb == NULL ||
-        img->w < 1 || img->w > PSPSKY_UI_TL_IMG_MAX_W ||
+        img->w < 1 || img->w > max_w ||
         img->h < 1 || img->h > PSPSKY_UI_TL_IMG_MAX_H) {
         return NULL;
     }
     return img;
 }
 
-/* Height taken under the body by the thumbnail or the marker line. Shared so
-   that ui_layout_post() and ui_draw_post() cannot drift apart. */
-static int ui_post_extra_h(const pspsky_post_t *post,
-                           const pspsky_ui_tl_image_t *img)
+/*
+ * Keep original image indices. NULL means all images are unavailable and the
+ * count marker should be shown.
+ */
+static const pspsky_ui_tl_image_t *ui_tl_images(const pspsky_ui_timeline_view_t *view,
+                                               int idx)
 {
-    if (img != NULL) {
-        int h = UI_TL_IMG_GAP + img->h;
+    int count = ui_image_count(&view->posts[idx]);
+    int i;
 
-        if (post->img_count >= 2) {
-            h += UI_LINE_H;   /* the "[images xN]" line under the thumbnail */
+    if (view->images != NULL) {
+        for (i = 0; i < count; i++) {
+            if (ui_tl_image(view->images[idx], i, count) != NULL) {
+                return view->images[idx];
+            }
         }
-        return h;
+    }
+    return NULL;
+}
+
+static const pspsky_ui_avatar_t *ui_avatar(const pspsky_ui_timeline_view_t *view,
+                                           int idx)
+{
+    return (view->avatars != NULL) ? &view->avatars[idx] : NULL;
+}
+
+/* Must match the attachment layout in ui_draw_post(). */
+static int ui_post_extra_h(const pspsky_post_t *post,
+                           const pspsky_ui_tl_image_t *images)
+{
+    if (images != NULL) {
+        int count = ui_image_count(post);
+        int rows = (count + 1) / 2;
+
+        if (count == 1) {
+            return UI_TL_IMG_GAP + images[0].h;
+        }
+        return UI_TL_IMG_GAP + rows * PSPSKY_UI_TL_IMG_MAX_H +
+               (rows - 1) * PSPSKY_UI_TL_GRID_GAP;
     }
     if (post->img_count >= 1) {
-        return UI_LINE_H;     /* marker line instead of the thumbnail */
+        return UI_TL_IMG_GAP + UI_CHIP_H;
     }
     /* Link cards and quoted records get no marker of their own. */
     return 0;
 }
 
-/* Marker text for a post with img_count >= 1 and no usable thumbnail. */
 static const char *ui_img_mark(const pspsky_post_t *post, char *buf, size_t cap)
 {
     if (post->img_count < 2) {
@@ -527,19 +841,54 @@ static const char *ui_img_mark(const pspsky_post_t *post, char *buf, size_t cap)
     return buf;
 }
 
-/* Returns the slot holding post idx, uploading it on a miss. */
-static const unsigned int *ui_tl_tex_bind(int idx, const pspsky_ui_tl_image_t *img)
+static void ui_round_corners(unsigned int *tex, int stride, int w, int h)
+{
+    int x, y;
+
+    if (w < 2 * UI_IMG_RADIUS || h < 2 * UI_IMG_RADIUS) {
+        return;
+    }
+    for (y = 0; y < UI_IMG_RADIUS; y++) {
+        unsigned int *top = tex + (size_t)y * (size_t)stride;
+        unsigned int *bot = tex + (size_t)(h - 1 - y) * (size_t)stride;
+
+        for (x = 0; x < UI_IMG_RADIUS; x++) {
+            unsigned int a = (unsigned int)s_corner_a[y][x] << 24;
+
+            top[x]         = (top[x] & 0x00FFFFFFu) | a;
+            top[w - 1 - x] = (top[w - 1 - x] & 0x00FFFFFFu) | a;
+            bot[x]         = (bot[x] & 0x00FFFFFFu) | a;
+            bot[w - 1 - x] = (bot[w - 1 - x] & 0x00FFFFFFu) | a;
+        }
+    }
+}
+
+/*
+ * Upload on a cache miss. Never overwrite a texture queued in the current
+ * asynchronous GU frame.
+ */
+static const unsigned int *ui_tl_tex_bind(int idx, int image,
+                                          const pspsky_ui_tl_image_t *img)
 {
     unsigned int *tex;
-    int           slot, x, y;
+    int           slot, attempt, x, y;
 
     for (slot = 0; slot < UI_TL_TEX_SLOTS; slot++) {
-        if (s_tl_tex_post[slot] == idx) {
+        if (s_tl_tex_post[slot] == idx && s_tl_tex_image[slot] == image) {
+            s_tl_tex_pinned[slot] = 1;
             return s_tl_tex[slot];
         }
     }
-    slot          = s_tl_tex_next;
-    s_tl_tex_next = (s_tl_tex_next + 1) % UI_TL_TEX_SLOTS;
+    for (attempt = 0; attempt < UI_TL_TEX_SLOTS; attempt++) {
+        slot = (s_tl_tex_next + attempt) % UI_TL_TEX_SLOTS;
+        if (!s_tl_tex_pinned[slot]) {
+            break;
+        }
+    }
+    if (attempt == UI_TL_TEX_SLOTS) {
+        return NULL;
+    }
+    s_tl_tex_next = (slot + 1) % UI_TL_TEX_SLOTS;
     tex           = s_tl_tex[slot];
 
     for (y = 0; y < img->h; y++) {
@@ -553,22 +902,24 @@ static const unsigned int *ui_tl_tex_bind(int idx, const pspsky_ui_tl_image_t *i
                      (unsigned int)src[x * 3 + 0];
         }
     }
+    ui_round_corners(tex, UI_TL_TEX_W, img->w, img->h);
     sceKernelDcacheWritebackRange(tex,
                                   (unsigned int)UI_TL_TEX_W * 4u *
                                   (unsigned int)img->h);
+    /* Flush any cached texels from the previous slot contents. */
+    sceGuTexFlush();
     s_tl_tex_post[slot] = idx;
+    s_tl_tex_image[slot] = image;
+    s_tl_tex_pinned[slot] = 1;
     return tex;
 }
 
-/* Draws the thumbnail at 1:1; the list scissor clips it. */
-static void ui_tl_draw_image(int idx, const pspsky_ui_tl_image_t *img,
-                             int x, int y)
+static void ui_draw_tex(const unsigned int *tex, int tw, int th,
+                        int w, int h, int x, int y)
 {
-    const unsigned int *tex;
-    ui_tex_vertex_f_t  *v;
+    ui_tex_vertex_f_t *v;
 
-    tex = ui_tl_tex_bind(idx, img);
-    v   = (ui_tex_vertex_f_t *)sceGuGetMemory(2 * sizeof(ui_tex_vertex_f_t));
+    v = (ui_tex_vertex_f_t *)sceGuGetMemory(2 * sizeof(ui_tex_vertex_f_t));
     if (!v) {
         return;
     }
@@ -577,51 +928,243 @@ static void ui_tl_draw_image(int idx, const pspsky_ui_tl_image_t *img,
     v[0].x = (float)x;
     v[0].y = (float)y;
     v[0].z = 0.0f;
-    v[1].u = (float)img->w;
-    v[1].v = (float)img->h;
-    v[1].x = (float)(x + img->w);
-    v[1].y = (float)(y + img->h);
+    v[1].u = (float)w;
+    v[1].v = (float)h;
+    v[1].x = (float)(x + w);
+    v[1].y = (float)(y + h);
     v[1].z = 0.0f;
 
-    /* intraFontPrint returns with GU_DEPTH_TEST enabled. */
+    /* intraFont re-enables depth testing. */
     sceGuDisable(GU_DEPTH_TEST);
     sceGuEnable(GU_TEXTURE_2D);
     sceGuTexMode(GU_PSM_8888, 0, 0, 0);
-    sceGuTexImage(0, UI_TL_TEX_W, UI_TL_TEX_H, UI_TL_TEX_W, tex);
-    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
-    sceGuTexFilter(GU_NEAREST, GU_NEAREST);   /* 1:1, so no filtering needed */
+    sceGuTexImage(0, tw, th, tw, tex);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);  /* unscaled texture */
     sceGuTexWrap(GU_CLAMP, GU_CLAMP);
-    /* GU_TCC_RGB takes alpha from the vertex colour; these carry none. */
     sceGuColor(0xFFFFFFFF);
-    /* Must be float (32BITF), as in ui_prev_draw_image(). */
     sceGuDrawArray(GU_SPRITES,
                    GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
                    2, 0, v);
+    s_tex = UI_TEX_OTHER;
+}
 
-    /* intraFontPrint skips rebinding its texture while INTRAFONT_ACTIVE, so
-       later text would sample the thumbnail bound above. */
-    if (s_font) {
-        intraFontActivate(s_font);
+static int ui_tl_draw_image(int idx, int image, const pspsky_ui_tl_image_t *img,
+                            int x, int y)
+{
+    const unsigned int *tex = ui_tl_tex_bind(idx, image, img);
+
+    if (tex == NULL) {
+        return 0;
+    }
+    ui_draw_tex(tex, UI_TL_TEX_W, UI_TL_TEX_H, img->w, img->h, x, y);
+    return 1;
+}
+
+static const unsigned int *ui_av_tex_bind(const unsigned char *rgb)
+{
+    const unsigned char *c = k_ui_icon_rect[UI_ICON_CIRCLE32];
+    unsigned int        *tex;
+    int                  slot, best = -1, x, y;
+
+    for (slot = 0; slot < UI_AV_SLOTS; slot++) {
+        if (s_av_key[slot] == rgb) {
+            s_av_used[slot] = s_frame;
+            return s_av_tex[slot];
+        }
+    }
+    for (slot = 0; slot < UI_AV_SLOTS; slot++) {
+        if (s_av_key[slot] == NULL) {
+            best = slot;
+            break;
+        }
+        if (best < 0 || s_av_used[slot] < s_av_used[best]) {
+            best = slot;
+        }
+    }
+
+    tex = s_av_tex[best];
+    for (y = 0; y < UI_AVATAR_PX; y++) {
+        const unsigned char *src  = rgb + (size_t)y * UI_AVATAR_PX * 3u;
+        const unsigned int  *mask = s_atlas + (size_t)(c[1] + y) * UI_ATLAS_W + c[0];
+        unsigned int        *dst  = tex + (size_t)y * UI_AVATAR_PX;
+
+        for (x = 0; x < UI_AVATAR_PX; x++) {
+            dst[x] = (mask[x] & 0xFF000000u) |
+                     ((unsigned int)src[x * 3 + 2] << 16) |
+                     ((unsigned int)src[x * 3 + 1] << 8) |
+                     (unsigned int)src[x * 3 + 0];
+        }
+    }
+    sceKernelDcacheWritebackRange(tex, sizeof s_av_tex[0]);
+    sceGuTexFlush();
+    s_av_key[best]  = rgb;
+    s_av_used[best] = s_frame;
+    return tex;
+}
+
+static void ui_draw_avatar(const pspsky_ui_avatar_t *av, int x, int y)
+{
+    if (av == NULL || av->rgb == NULL) {
+        ui_icon(UI_ICON_CIRCLE32, x, y, UI_COL_AVATAR);
+        ui_icon(UI_ICON_AVATAR32, x, y, UI_COL_TEXT);
+        return;
+    }
+    ui_draw_tex(ui_av_tex_bind(av->rgb), UI_AVATAR_PX, UI_AVATAR_PX,
+                UI_AVATAR_PX, UI_AVATAR_PX, x, y);
+}
+
+static void ui_draw_img_chip(const pspsky_post_t *post, int x, int y)
+{
+    char        buf[32];
+    const char *label = ui_img_mark(post, buf, sizeof buf);
+    int         w     = 8 + 12 + 5 + (int)ui_measure(UI_SIZE_SMALL, label) + 9;
+
+    ui_fill_rrect(x, y, w, UI_CHIP_H, 6, UI_COL_BORDER);
+    ui_fill_rrect(x + 1, y + 1, w - 2, UI_CHIP_H - 2, 5, UI_COL_BG);
+    ui_icon(UI_ICON_PICTURE, x + 8, y + 4, UI_COL_MED);
+    ui_text(UI_SIZE_SMALL, UI_COL_MED, (float)(x + 25), (float)(y + 14), label);
+}
+
+/* An unavailable attachment keeps its original cell and image icon. */
+static void ui_draw_img_placeholder(int x, int y, int w, int h)
+{
+    ui_fill_rrect(x, y, w, h, UI_IMG_RADIUS, UI_COL_CARD);
+    if (w >= 12 && h >= 12) {
+        ui_icon(UI_ICON_PICTURE, x + (w - 12) / 2, y + (h - 12) / 2, UI_COL_MED);
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Timeline layout                                                     */
-/* ------------------------------------------------------------------ */
+static const char *ui_repost_text(const pspsky_post_t *post, char *buf, size_t cap)
+{
+    switch (post->repost) {
+    case PSPSKY_REPOST_BY:
+        snprintf(buf, cap, pspsky_tr(PSPSKY_STR_UI_REPOSTED_BY), post->repost_by);
+        return buf;
+    case PSPSKY_REPOST_BY_SELF:
+        return pspsky_tr(PSPSKY_STR_UI_REPOSTED_BY_YOU);
+    default:
+        return NULL;
+    }
+}
 
-/* Wraps the body and fits the header of post idx into the layout cache, so
-   that ui_draw_post() needs no measuring, and returns the post height.
-   Must stay in step with how ui_draw_post() accumulates h. */
+static const char *ui_reply_text(const pspsky_post_t *post, char *buf, size_t cap)
+{
+    switch (post->reply) {
+    case PSPSKY_REPLY_TO:
+        snprintf(buf, cap, pspsky_tr(PSPSKY_STR_UI_REPLIED_TO), post->reply_to);
+        return buf;
+    case PSPSKY_REPLY_TO_SELF:
+        return pspsky_tr(PSPSKY_STR_UI_REPLIED_TO_YOU);
+    case PSPSKY_REPLY_TO_POST:
+        return pspsky_tr(PSPSKY_STR_UI_REPLIED_TO_POST);
+    case PSPSKY_REPLY_TO_BLOCKED:
+        return pspsky_tr(PSPSKY_STR_UI_REPLIED_TO_BLOCKED);
+    default:
+        return NULL;
+    }
+}
+
+/*
+ * Must match the vertical advances and context-line conditions in
+ * ui_draw_post().
+ */
+static int ui_post_height(const pspsky_post_t *post, const ui_post_cache_t *c,
+                          const pspsky_ui_tl_image_t *images)
+{
+    char buf[UI_CTX_BUF];
+    int  col = UI_META_H + c->lines * UI_LINE_H + ui_post_extra_h(post, images);
+
+    if (ui_reply_text(post, buf, sizeof buf) != NULL) {
+        col += UI_CTX_H;
+    }
+    if (col < UI_AVATAR_PX) {
+        col = UI_AVATAR_PX;
+    }
+    return UI_POST_PAD_T +
+           ((ui_repost_text(post, buf, sizeof buf) != NULL) ? UI_CTX_H : 0) +
+           col + UI_POST_PAD_B;
+}
+
+static float ui_time_w(const char *t)
+{
+    if (t[0] == '\0') {
+        return 0.0f;
+    }
+    return (float)(2 * UI_DOT_GAP + UI_DOT_PX) + ui_measure(UI_SIZE_NAME, t);
+}
+
+static void ui_post_time(const pspsky_post_t *post, long long now_unix,
+                         char *buf, size_t cap)
+{
+    if (pspsky_format_relative(post->created_at_unix, now_unix,
+                               buf, cap) != PSPSKY_OK) {
+        buf[0] = '\0';
+    }
+}
+
+/*
+ * Reserve room for the time; omit the handle when too little fits or it is
+ * already used as the display name.
+ */
+static void ui_fit_meta(ui_post_cache_t *c, const pspsky_post_t *post, float room)
+{
+    char        namebuf[UI_NAME_BUF];
+    char        hsrc[UI_HSRC_BUF];
+    char        hbuf[UI_HANDLE_BUF];
+    const char *name  = (post->display_name[0] != '\0') ? post->display_name
+                                                         : post->handle;
+    float       avail = (float)UI_CONTENT_W - room;
+    float       name_max = (float)UI_CONTENT_W * 0.7f;
+    float       w;
+
+    hsrc[0] = '\0';
+    if (name_max > avail || post->display_name[0] == '\0') {
+        name_max = avail;
+    }
+    ui_fit_head_calc(name, UI_SIZE_NAME, name_max - 1.0f, UI_NAME_BUF, &c->name);
+    w = ui_measure_bold(UI_SIZE_NAME,
+                        ui_fit_head_apply(name, &c->name, namebuf, UI_NAME_BUF));
+
+    c->time_room  = room;
+    c->has_handle = 0;
+    c->handle.cut = 0;
+    c->handle.ell = 0;
+    if (post->display_name[0] != '\0' && post->handle[0] != '\0') {
+        snprintf(hsrc, sizeof hsrc, " @%s", post->handle);
+        ui_fit_head_calc(hsrc, UI_SIZE_NAME, avail - w, UI_HANDLE_BUF, &c->handle);
+        if (c->handle.cut >= 4) {  /* " @" and at least two handle bytes */
+            c->has_handle = 1;
+        } else if (name_max < avail) {
+            ui_fit_head_calc(name, UI_SIZE_NAME, avail - 1.0f, UI_NAME_BUF,
+                             &c->name);
+            w = ui_measure_bold(UI_SIZE_NAME,
+                                ui_fit_head_apply(name, &c->name, namebuf,
+                                                  UI_NAME_BUF));
+        }
+    }
+    c->handle_x = (float)UI_CONTENT_X + w;
+    c->time_x   = c->handle_x;
+    if (c->has_handle) {
+        c->time_x += ui_measure(UI_SIZE_NAME,
+                                ui_fit_head_apply(hsrc, &c->handle, hbuf,
+                                                  UI_HANDLE_BUF));
+    } else {
+        c->handle.cut = 0;
+        c->handle.ell = 0;
+    }
+}
+
 static int ui_layout_post(int idx, const pspsky_post_t *post,
-                          const pspsky_ui_tl_image_t *img)
+                          const pspsky_ui_tl_image_t *images, long long now_unix)
 {
     ui_post_cache_t *c = &s_post_cache[idx];
-    char             namebuf[UI_NAME_BUF];
-    const char      *name;
-    float            w, avail;
-    int              lines, i, h;
+    char             ctxbuf[UI_CTX_BUF];
+    char             tbuf[24];
+    const char      *ctx;
+    int              lines, i;
 
-    lines = ui_wrap(post->text, UI_SIZE_BODY, UI_BODY_W);
+    lines = ui_wrap(post->text, UI_SIZE_BODY, (float)UI_CONTENT_W);
     if (lines > UI_WRAP_MAX_LINES) {
         lines = UI_WRAP_MAX_LINES;
     }
@@ -631,28 +1174,27 @@ static int ui_layout_post(int idx, const pspsky_post_t *post,
     }
     c->lines = (short)lines;
 
-    /* Header line: name, then @handle in whatever width is left. */
-    name = (post->display_name[0] != '\0') ? post->display_name : post->handle;
-    ui_fit_head_calc(name, UI_SIZE_NAME, UI_BODY_W, UI_NAME_BUF, &c->name);
-    w = ui_measure(UI_SIZE_NAME,
-                   ui_fit_head_apply(name, &c->name, namebuf, UI_NAME_BUF));
-    avail = UI_BODY_W - w;
+    /* Reserve one extra time digit before the names need refitting. */
+    ui_post_time(post, now_unix, tbuf, sizeof tbuf);
+    ui_fit_meta(c, post, ui_time_w(tbuf) + s_digit_w);
 
-    c->handle_x   = (float)UI_MARGIN_X + w;
-    c->has_handle = 0;
-    c->handle.cut = 0;
-    c->handle.ell = 0;
-    if (post->handle[0] != '\0' && avail > 0.0f) {
-        char hsrc[UI_HSRC_BUF];
-
-        snprintf(hsrc, sizeof hsrc, " @%s", post->handle);
-        ui_fit_head_calc(hsrc, UI_SIZE_NAME, avail, UI_HANDLE_BUF, &c->handle);
-        c->has_handle = 1;
+    c->repost.cut = 0;
+    c->repost.ell = 0;
+    ctx = ui_repost_text(post, ctxbuf, sizeof ctxbuf);
+    if (ctx != NULL) {
+        ui_fit_head_calc(ctx, UI_SIZE_SMALL, (float)UI_CONTENT_W, UI_CTX_BUF,
+                         &c->repost);
+    }
+    c->reply.cut = 0;
+    c->reply.ell = 0;
+    ctx = ui_reply_text(post, ctxbuf, sizeof ctxbuf);
+    if (ctx != NULL) {
+        ui_fit_head_calc(ctx, UI_SIZE_SMALL,
+                         (float)(UI_CONTENT_W - UI_CTX_ICON - 3), UI_CTX_BUF,
+                         &c->reply);
     }
 
-    h = UI_LINE_H + UI_TIME_LINE_H + lines * UI_LINE_H + UI_POST_PAD;
-    h += ui_post_extra_h(post, img);
-    return h;
+    return ui_post_height(post, c, images);
 }
 
 static int ui_clamp_count(int count)
@@ -674,9 +1216,14 @@ static void ui_rebuild_layout(const pspsky_ui_timeline_view_t *view)
 
     for (i = 0; i < n; i++) {
         s_post_top[i] = y;
-        y += ui_layout_post(i, &view->posts[i], ui_tl_image(view, i));
+        y += ui_layout_post(i, &view->posts[i], ui_tl_images(view, i),
+                            view->now_unix);
     }
     s_post_top[n]  = y;
+    s_layout_more  = (view->has_more != 0);
+    if (n > 0 && s_layout_more) {
+        y += UI_END_H;
+    }
     s_content_h    = y;
     s_layout_count = n;
     s_layout_valid = 1;
@@ -684,14 +1231,10 @@ static void ui_rebuild_layout(const pspsky_ui_timeline_view_t *view)
 
 static int ui_max_scroll(void)
 {
-    int m = s_content_h - UI_LIST_H;
+    int m = UI_PAD_TOP + s_content_h + UI_PAD_BOTTOM - UI_SCR_H;
 
     return (m > 0) ? m : 0;
 }
-
-/* ------------------------------------------------------------------ */
-/* Drawing a single post                                               */
-/* ------------------------------------------------------------------ */
 
 /* Steps back to the start of the code point covering off, but not past lo. */
 static int ui_cp_floor(const char *text, int off, int lo)
@@ -702,7 +1245,7 @@ static int ui_cp_floor(const char *text, int off, int lo)
     return off;
 }
 
-/* Draws text[start .. start+len) and returns the pen x after it. */
+/* Draw text[start..start+len) and return the next pen position. */
 static float ui_body_seg(const char *text, int start, int len,
                          unsigned int color, float x, float y)
 {
@@ -719,9 +1262,6 @@ static float ui_body_seg(const char *text, int start, int len,
     return ui_text(UI_SIZE_BODY, color, x, y, seg);
 }
 
-/* Draws one wrapped body line, tinting the parts covered by a link facet.
-   Purely a colour split: the same bytes are printed in the same order, so the
-   pen ends where a single print of the whole line would have left it. */
 static void ui_draw_body_line(const pspsky_post_t *post, int start, int len,
                               float x, float y)
 {
@@ -734,20 +1274,18 @@ static void ui_draw_body_line(const pspsky_post_t *post, int start, int len,
         int le = (int)post->link_end[k];
 
         if (le <= pos) {
-            continue;   /* ends before this line, or already covered */
+            continue;
         }
         if (ls >= end) {
-            break;      /* starts are sorted, so the rest are further on */
+            break;  /* link ranges are sorted by start */
         }
         if (ls < pos) {
-            ls = pos;   /* overlapping ranges clamp to the previous segment */
+            ls = pos;
         }
         if (le > end) {
             le = end;
         }
-        /* Ranges are raw byte offsets, so a split can land inside a multi-byte
-           character; back both ends up to a boundary rather than hand
-           intraFont a truncated sequence. */
+        /* Clamp facet byte offsets to UTF-8 boundaries for intraFont. */
         ls = ui_cp_floor(post->text, ls, pos);
         le = ui_cp_floor(post->text, le, ls);
         if (le <= ls) {
@@ -760,106 +1298,164 @@ static void ui_draw_body_line(const pspsky_post_t *post, int start, int len,
     ui_body_seg(post->text, pos, end - pos, UI_COL_TEXT, x, y);
 }
 
-/* idx indexes the layout cache built by ui_layout_post(); it must be < the
-   s_layout_count that the current s_layout_valid covers. */
-static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
-                         long long now_unix, const pspsky_ui_tl_image_t *img)
+static int ui_visible(int y, int h)
 {
-    const ui_post_cache_t *c = &s_post_cache[idx];
+    return (y + h > s_vis_top && y < s_vis_bottom);
+}
+
+/* Requires a valid layout cache and idx < s_layout_count. */
+static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
+                         long long now_unix, const pspsky_ui_tl_image_t *images,
+                         const pspsky_ui_avatar_t *av)
+{
+    ui_post_cache_t *c = &s_post_cache[idx];
     char        hsrc[UI_HSRC_BUF];
-    char        namebuf[UI_NAME_BUF];     /* display name or handle + ellipsis */
+    char        namebuf[UI_NAME_BUF];
     char        handlebuf[UI_HANDLE_BUF];
-    char        markbuf[32];
+    char        ctxbuf[UI_CTX_BUF];
+    char        fitbuf[UI_CTX_BUF];
     char        tbuf[24];
     const char *name;
-    int         body_top, lines, i, h, below;
+    const char *ctx;
+    int         y, row, i;
 
-    name = (post->display_name[0] != '\0') ? post->display_name : post->handle;
+    y = top + UI_POST_PAD_T;
 
-    /* Header line: name, then @handle in whatever width is left. Both were
-       fitted in ui_layout_post(), so rebuilding them here only copies bytes. */
-    ui_text(UI_SIZE_NAME, UI_COL_NAME, (float)UI_MARGIN_X,
-            (float)(top + UI_BASELINE),
-            ui_fit_head_apply(name, &c->name, namebuf, UI_NAME_BUF));
+    ctx = ui_repost_text(post, ctxbuf, sizeof ctxbuf);
+    if (ctx != NULL) {
+        if (ui_visible(y, UI_CTX_H)) {
+            ui_icon(UI_ICON_REPOST, UI_CONTENT_X - UI_CTX_ICON - 4, y + 1,
+                    UI_COL_MED);
+            ui_text(UI_SIZE_SMALL, UI_COL_MED, (float)UI_CONTENT_X,
+                    (float)(y + UI_CTX_BASE),
+                    ui_fit_head_apply(ctx, &c->repost, fitbuf, sizeof fitbuf));
+        }
+        y += UI_CTX_H;
+    }
+    row = y;
 
-    if (c->has_handle) {
-        snprintf(hsrc, sizeof hsrc, " @%s", post->handle);
-        ui_text(UI_SIZE_NAME, UI_COL_DIM, c->handle_x,
-                (float)(top + UI_BASELINE),
-                ui_fit_head_apply(hsrc, &c->handle, handlebuf, UI_HANDLE_BUF));
+    if (ui_visible(row, UI_AVATAR_PX)) {
+        ui_draw_avatar(av, UI_AVATAR_X, row);
     }
 
-    /* Timestamp line: right-aligned, dimmed, tighter than a body line. */
-    tbuf[0] = '\0';
-    if (pspsky_format_relative(post->created_at_unix, now_unix,
-                               tbuf, sizeof(tbuf)) != PSPSKY_OK) {
-        tbuf[0] = '\0';
+    if (ui_visible(row, UI_META_H)) {
+        float tw;
+
+        ui_post_time(post, now_unix, tbuf, sizeof tbuf);
+        tw = ui_time_w(tbuf);
+        if (tw > c->time_room) {
+            ui_fit_meta(c, post, tw + s_digit_w);
+        }
+        name = (post->display_name[0] != '\0') ? post->display_name : post->handle;
+        ui_text_bold(UI_SIZE_NAME, UI_COL_TEXT, (float)UI_CONTENT_X,
+                     (float)(row + UI_META_BASE),
+                     ui_fit_head_apply(name, &c->name, namebuf, UI_NAME_BUF));
+        if (c->has_handle) {
+            snprintf(hsrc, sizeof hsrc, " @%s", post->handle);
+            ui_text(UI_SIZE_NAME, UI_COL_MED, c->handle_x,
+                    (float)(row + UI_META_BASE),
+                    ui_fit_head_apply(hsrc, &c->handle, handlebuf, UI_HANDLE_BUF));
+        }
+        if (tbuf[0] != '\0') {
+            /* jpn0.pgf lacks U+00B7; draw the separator as an icon. */
+            int dx = (int)(c->time_x + 0.5f) + UI_DOT_GAP;
+
+            ui_icon_scaled(UI_ICON_CIRCLE16, (float)dx,
+                           (float)(row + UI_META_BASE - 5),
+                           (float)UI_DOT_PX, (float)UI_DOT_PX, UI_COL_MED);
+            ui_text(UI_SIZE_NAME, UI_COL_MED,
+                    (float)(dx + UI_DOT_PX + UI_DOT_GAP),
+                    (float)(row + UI_META_BASE), tbuf);
+        }
     }
-    if (tbuf[0] != '\0') {
-        float tw = ui_measure(UI_SIZE_FOOTER, tbuf);
+    y = row + UI_META_H;
 
-        ui_text(UI_SIZE_FOOTER, UI_COL_DIM,
-                (float)(UI_SCR_W - UI_MARGIN_X) - tw,
-                (float)(top + UI_LINE_H + UI_TIME_BASELINE), tbuf);
+    ctx = ui_reply_text(post, ctxbuf, sizeof ctxbuf);
+    if (ctx != NULL) {
+        if (ui_visible(y, UI_CTX_H)) {
+            ui_icon(UI_ICON_REPLY, UI_CONTENT_X, y + 1, UI_COL_MED);
+            ui_text(UI_SIZE_SMALL, UI_COL_MED,
+                    (float)(UI_CONTENT_X + UI_CTX_ICON + 3),
+                    (float)(y + UI_CTX_BASE),
+                    ui_fit_head_apply(ctx, &c->reply, fitbuf, sizeof fitbuf));
+        }
+        y += UI_CTX_H;
     }
 
-    /* Body, wrapped to UI_BODY_W by ui_layout_post(). */
-    body_top = top + UI_LINE_H + UI_TIME_LINE_H;
-    lines    = c->lines;
-    for (i = 0; i < lines; i++) {
-        int ly = body_top + i * UI_LINE_H;
+    for (i = 0; i < c->lines; i++) {
+        int ly = y + i * UI_LINE_H;
 
-        if (ly + UI_LINE_H < UI_LIST_TOP || ly > UI_LIST_BOTTOM) {
-            continue;   /* skip lines that are off screen */
+        if (!ui_visible(ly, UI_LINE_H)) {
+            continue;
         }
         ui_draw_body_line(post, s_pw_start[idx][i], s_pw_len[idx][i],
-                          (float)UI_MARGIN_X, (float)(ly + UI_BASELINE));
+                          (float)UI_CONTENT_X, (float)(ly + UI_BASELINE));
     }
+    y += c->lines * UI_LINE_H;
 
-    h     = UI_LINE_H + UI_TIME_LINE_H + lines * UI_LINE_H + UI_POST_PAD;
-    below = body_top + lines * UI_LINE_H;
+    /* Same cases as ui_post_extra_h(), which supplies the height. */
+    if (images != NULL) {
+        int count = ui_image_count(post);
+        int iy = y + UI_TL_IMG_GAP;
 
-    /* Same two cases as ui_post_extra_h(), which supplies the height. */
-    if (img != NULL) {
-        int iy = below + UI_TL_IMG_GAP;
+        if (count == 1) {
+            const pspsky_ui_tl_image_t *img = &images[0];
 
-        if (iy + img->h >= UI_LIST_TOP && iy <= UI_LIST_BOTTOM) {
-            ui_tl_draw_image(idx, img, UI_MARGIN_X, iy);
-        }
-        if (post->img_count >= 2) {
-            int my = iy + img->h;
+            if (ui_visible(iy, img->h) &&
+                !ui_tl_draw_image(idx, 0, img, UI_CONTENT_X, iy)) {
+                ui_draw_img_placeholder(UI_CONTENT_X, iy, img->w, img->h);
+            }
+        } else {
+            for (i = 0; i < count; i++) {
+                const pspsky_ui_tl_image_t *img = ui_tl_image(images, i, count);
+                int x = UI_CONTENT_X + (i % 2) *
+                        (PSPSKY_UI_TL_GRID_COL_W + PSPSKY_UI_TL_GRID_GAP);
+                int cy = iy + (i / 2) *
+                         (PSPSKY_UI_TL_IMG_MAX_H + PSPSKY_UI_TL_GRID_GAP);
 
-            if (my + UI_LINE_H >= UI_LIST_TOP && my <= UI_LIST_BOTTOM) {
-                ui_text(UI_SIZE_NAME, UI_COL_DIM,
-                        (float)UI_MARGIN_X, (float)(my + UI_BASELINE),
-                        ui_img_mark(post, markbuf, sizeof markbuf));
+                if (!ui_visible(cy, PSPSKY_UI_TL_IMG_MAX_H)) {
+                    continue;
+                }
+                if (img != NULL) {
+                    int ix = x + (PSPSKY_UI_TL_GRID_COL_W - img->w) / 2;
+                    int image_y = cy + (PSPSKY_UI_TL_IMG_MAX_H - img->h) / 2;
+
+                    ui_fill_rrect(x, cy, PSPSKY_UI_TL_GRID_COL_W,
+                                   PSPSKY_UI_TL_IMG_MAX_H, UI_IMG_RADIUS, UI_COL_CARD);
+                    if (!ui_visible(image_y, img->h) ||
+                        ui_tl_draw_image(idx, i, img, ix, image_y)) {
+                        continue;
+                    }
+                }
+                ui_draw_img_placeholder(x, cy, PSPSKY_UI_TL_GRID_COL_W,
+                                         PSPSKY_UI_TL_IMG_MAX_H);
             }
         }
     } else if (post->img_count >= 1) {
-        if (below + UI_LINE_H >= UI_LIST_TOP && below <= UI_LIST_BOTTOM) {
-            ui_text(UI_SIZE_NAME, UI_COL_DIM,
-                    (float)UI_MARGIN_X, (float)(below + UI_BASELINE),
-                    ui_img_mark(post, markbuf, sizeof markbuf));
+        if (ui_visible(y + UI_TL_IMG_GAP, UI_CHIP_H)) {
+            ui_draw_img_chip(post, UI_CONTENT_X, y + UI_TL_IMG_GAP);
         }
     }
-    h += ui_post_extra_h(post, img);
 
-    /* separator line */
-    ui_draw_rect(UI_MARGIN_X, top + h - 3, UI_SCR_W - UI_MARGIN_X * 2, 1, UI_COL_SEP);
+    ui_draw_rect(0, top + (s_post_top[idx + 1] - s_post_top[idx]) - 1,
+                 UI_SCR_W, 1, UI_COL_BORDER);
 }
 
-/* ------------------------------------------------------------------ */
-/* Header / footer / scrollbar                                         */
-/* ------------------------------------------------------------------ */
-
-static void ui_draw_header(const char *my_handle)
+static void ui_draw_tl_header(int y, const char *my_handle)
 {
-    ui_draw_rect(0, 0, UI_SCR_W, UI_HEADER_H, UI_COL_BAR);
-    ui_text(UI_SIZE_HEADER, UI_COL_TEXT, 6.0f, 14.0f, "PSPSky");
+    /* Language is fixed at startup, so this width remains valid. */
+    static float tab_w = -1.0f;
+    const char  *tab   = pspsky_tr(PSPSKY_STR_UI_TAB_FOLLOWING);
+
+    ui_draw_header_bar(y);
+    ui_icon(UI_ICON_LOGO20, 10, y + 3, UI_COL_PRIMARY);
+    if (tab_w < 0.0f) {
+        tab_w = ui_measure_bold(UI_SIZE_TAB, tab);
+    }
+    ui_text_bold(UI_SIZE_TAB, UI_COL_TEXT, 38.0f, (float)(y + 16), tab);
+    ui_draw_rect(38, y + UI_HEADER_H - 3, (int)(tab_w + 0.5f), 2, UI_COL_PRIMARY);
 
     if (my_handle && my_handle[0] != '\0') {
-        /* Right-aligned, so it needs a width. The handle almost never changes,
-           so it is measured once and remembered rather than every frame. */
         static char  cached[PSPSKY_MAX_HANDLE + 8];
         static float cached_w;
         char  buf[PSPSKY_MAX_HANDLE + 8];
@@ -870,83 +1466,140 @@ static void ui_draw_header(const char *my_handle)
             snprintf(buf, sizeof(buf), "@%s", my_handle);
         }
         if (strcmp(buf, cached) != 0) {
-            cached_w = ui_measure(UI_SIZE_HEADER, buf);
+            cached_w = ui_measure(UI_SIZE_SMALL, buf);
             memcpy(cached, buf, strlen(buf) + 1);
         }
-        ui_text(UI_SIZE_HEADER, UI_COL_DIM,
-                (float)UI_SCR_W - 6.0f - cached_w, 14.0f, buf);
+        ui_text(UI_SIZE_SMALL, UI_COL_MED,
+                (float)UI_SCR_W - 10.0f - cached_w, (float)(y + 16), buf);
     }
 }
 
-static void ui_draw_footer(void)
+static void ui_draw_tl_footer(int y, int has_more)
 {
-    ui_draw_rect(0, UI_FOOTER_Y, UI_SCR_W, UI_FOOTER_H, UI_COL_BAR);
-    ui_text(UI_SIZE_FOOTER, UI_COL_TEXT, 6.0f, (float)(UI_FOOTER_Y + 14),
-            UI_FOOTER_TEXT);
+    static const ui_button_t post = {
+        UI_ICON_TRIANGLE, PSPSKY_STR_UI_KEY_POST, 1
+    };
+    int   cy = y + 1 + (UI_FOOTER_H - 1) / 2;
+    float x  = 10.0f;
+
+    ui_draw_footer_bar(y);
+    x = ui_hint(x, cy, "L", -1, PSPSKY_STR_UI_KEY_REFRESH) + 12.0f;
+    if (has_more) {
+        x = ui_hint(x, cy, "R", -1, PSPSKY_STR_UI_KEY_MORE) + 12.0f;
+    }
+    ui_hint(x, cy, "START", -1, PSPSKY_STR_UI_KEY_QUIT);
+    ui_draw_button((float)UI_SCR_W - 10.0f - ui_button_w(&post),
+                   cy - UI_BAR_BTN_H / 2, UI_BAR_BTN_H, &post, UI_COL_BORDER);
+}
+
+static void ui_draw_end_row(int y)
+{
+    float w = ui_hint_w("R", -1, PSPSKY_STR_UI_KEY_MORE);
+
+    ui_hint(((float)UI_SCR_W - w) * 0.5f, y + UI_END_H / 2, "R", -1,
+            PSPSKY_STR_UI_KEY_MORE);
 }
 
 static void ui_draw_scrollbar(void)
 {
     int max_scroll = ui_max_scroll();
+    int vis_h      = s_vis_bottom - s_vis_top;
+    int total      = UI_PAD_TOP + s_content_h + UI_PAD_BOTTOM;
     int knob_h, knob_y;
 
-    if (max_scroll <= 0) {
+    if (max_scroll <= 0 || vis_h <= 0) {
         return;
     }
-    knob_h = UI_LIST_H * UI_LIST_H / s_content_h;
+    knob_h = vis_h * UI_SCR_H / total;
     if (knob_h < 12) {
         knob_h = 12;
     }
-    knob_y = UI_LIST_TOP + (UI_LIST_H - knob_h) * s_scroll / max_scroll;
-
-    ui_draw_rect(UI_SCR_W - 6, UI_LIST_TOP, 4, UI_LIST_H, UI_COL_TRACK);
-    ui_draw_rect(UI_SCR_W - 6, knob_y, 4, knob_h, UI_COL_KNOB);
+    knob_y = s_vis_top + (vis_h - knob_h) * s_scroll / max_scroll;
+    ui_draw_rect(UI_SCR_W - 5, knob_y, 3, knob_h, UI_COL_KNOB);
 }
 
-/* ------------------------------------------------------------------ */
-/* Centred message box                                                 */
-/* ------------------------------------------------------------------ */
-
-static void ui_draw_message(const char *msg_utf8, const char *hint_utf8)
+static void ui_draw_dialog(const char *msg_utf8, int left,
+                           const ui_button_t *btns, int nbtn)
 {
-    const char *msg = (msg_utf8 != NULL) ? msg_utf8 : "";
-    int   lines = ui_wrap(msg, UI_SIZE_MSG, UI_MSG_W);
-    int   total = lines * UI_LINE_H + ((hint_utf8 != NULL) ? (UI_LINE_H + 8) : 0);
-    int   top   = (UI_SCR_H - total) / 2;
-    int   i;
-    int   box_y = top - 12;
-    int   box_h = total + 24;
+    const char *msg   = (msg_utf8 != NULL) ? msg_utf8 : "";
+    int         lines = ui_wrap(msg, UI_SIZE_MSG, UI_MSG_W);
+    float       text_w = 0.0f;
+    float       btn_w  = 0.0f;
+    float       bx;
+    int         card_w, card_h, card_x, card_y, ty, i;
 
-    if (box_y < 0) {
-        box_y = 0;
+    if (lines > UI_DLG_MAX_LINES) {
+        lines = UI_DLG_MAX_LINES;
     }
-    if (box_y + box_h > UI_SCR_H) {
-        box_h = UI_SCR_H - box_y;
-    }
-    ui_draw_rect(20, box_y, UI_SCR_W - 40, box_h, UI_COL_BOX);
+    for (i = 0; i < lines; i++) {
+        float w = ui_measure(UI_SIZE_MSG, ui_wrap_line(msg, i));
 
+        if (w > text_w) {
+            text_w = w;
+        }
+    }
+    for (i = 0; i < nbtn; i++) {
+        btn_w += ui_button_w(&btns[i]) + ((i > 0) ? (float)UI_BTN_GAP : 0.0f);
+    }
+
+    card_w = (int)((text_w > btn_w) ? text_w : btn_w) + 2 * UI_DLG_PAD;
+    if (card_w < UI_DLG_MIN_W) {
+        card_w = UI_DLG_MIN_W;
+    }
+    if (card_w > UI_DLG_MAX_W) {
+        card_w = UI_DLG_MAX_W;
+    }
+    card_h = UI_DLG_PAD + lines * UI_LINE_H +
+             ((nbtn > 0) ? 14 + UI_BTN_H : 0) + UI_DLG_PAD;
+    card_x = (UI_SCR_W - card_w) / 2;
+    card_y = (UI_SCR_H - card_h) / 2;
+
+    ui_fill_rrect(card_x, card_y, card_w, card_h, UI_DLG_RADIUS, UI_COL_BORDER);
+    ui_fill_rrect(card_x + 1, card_y + 1, card_w - 2, card_h - 2,
+                  UI_DLG_RADIUS - 1, UI_COL_CARD);
+
+    ty = card_y + UI_DLG_PAD;
+    for (i = 0; i < lines; i++) {
+        const char *line = ui_wrap_line(msg, i);
+        float       x    = (float)(card_x + UI_DLG_PAD);
+
+        if (!left) {
+            x = ((float)UI_SCR_W - ui_measure(UI_SIZE_MSG, line)) * 0.5f;
+        }
+        ui_text(UI_SIZE_MSG, UI_COL_TEXT, x,
+                (float)(ty + i * UI_LINE_H + UI_BASELINE), line);
+    }
+
+    bx = ((float)UI_SCR_W - btn_w) * 0.5f;
+    for (i = 0; i < nbtn; i++) {
+        ui_draw_button(bx, card_y + card_h - UI_DLG_PAD - UI_BTN_H, UI_BTN_H,
+                       &btns[i], UI_COL_BORDER);
+        bx += ui_button_w(&btns[i]) + (float)UI_BTN_GAP;
+    }
+}
+
+static void ui_draw_status(const char *msg_utf8)
+{
+    const unsigned char *lr    = k_ui_icon_rect[UI_ICON_LOGO48];
+    const char          *msg   = (msg_utf8 != NULL) ? msg_utf8 : "";
+    int                  lines = ui_wrap(msg, UI_SIZE_MSG, UI_MSG_W);
+    int                  top, i;
+
+    if (lines > UI_DLG_MAX_LINES) {
+        lines = UI_DLG_MAX_LINES;
+    }
+    top = (UI_SCR_H - (lr[3] + 20 + lines * UI_LINE_H)) / 2;
+    ui_icon(UI_ICON_LOGO48, (UI_SCR_W - lr[2]) / 2, top, UI_COL_PRIMARY);
+    top += lr[3] + 20;
     for (i = 0; i < lines; i++) {
         const char *line = ui_wrap_line(msg, i);
         float       w    = ui_measure(UI_SIZE_MSG, line);
 
-        ui_text(UI_SIZE_MSG, UI_COL_TEXT,
-                ((float)UI_SCR_W - w) * 0.5f,
+        ui_text(UI_SIZE_MSG, UI_COL_MED, ((float)UI_SCR_W - w) * 0.5f,
                 (float)(top + i * UI_LINE_H + UI_BASELINE), line);
-    }
-    if (hint_utf8 != NULL) {
-        float w = ui_measure(UI_SIZE_MSG, hint_utf8);
-
-        ui_text(UI_SIZE_MSG, UI_COL_DIM,
-                ((float)UI_SCR_W - w) * 0.5f,
-                (float)(top + lines * UI_LINE_H + 8 + UI_BASELINE), hint_utf8);
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* File browser - building the listing                                 */
-/* ------------------------------------------------------------------ */
-
-/* Does name end with suffix (ASCII), ignoring case? */
 static int ui_pick_has_suffix(const char *name, const char *suffix)
 {
     size_t n = strlen(name);
@@ -992,7 +1645,6 @@ static int ui_pick_cmp(const void *a, const void *b)
     return strcmp(x->name, y->name);
 }
 
-/* 1 if s_pick_cur is a drive root such as "ms0:/". */
 static int ui_pick_at_root(void)
 {
     size_t n = strlen(s_pick_cur);
@@ -1004,7 +1656,7 @@ static int ui_pick_at_root(void)
     return (i + 1 >= n);
 }
 
-/* Sets the current directory, always with a trailing '/'. */
+/* s_pick_cur always ends in a slash. */
 static int ui_pick_set_dir(const char *src)
 {
     size_t n;
@@ -1013,7 +1665,7 @@ static int ui_pick_set_dir(const char *src)
         return -1;
     }
     n = strlen(src);
-    if (n + 2 > sizeof s_pick_cur) {   /* room for trailing '/' and NUL */
+    if (n + 2 > sizeof s_pick_cur) {
         return -1;
     }
     memcpy(s_pick_cur, src, n + 1);
@@ -1024,7 +1676,6 @@ static int ui_pick_set_dir(const char *src)
     return 0;
 }
 
-/* Parent of s_pick_cur into buf, stopping at the root. */
 static void ui_pick_parent_path(char *buf, size_t cap)
 {
     size_t n    = strlen(s_pick_cur);
@@ -1034,7 +1685,7 @@ static void ui_pick_parent_path(char *buf, size_t cap)
         root++;
     }
     if (root < n) {
-        root++;   /* keep the '/' immediately after the drive */
+        root++;  /* keep the '/' immediately after the drive */
     }
     if (n > root && s_pick_cur[n - 1] == '/') {
         n--;
@@ -1052,7 +1703,7 @@ static void ui_pick_parent_path(char *buf, size_t cap)
     buf[n] = '\0';
 }
 
-/* Joins s_pick_cur + name into buf; non-zero if it would not fit. */
+/* Returns nonzero if the joined path does not fit. */
 static int ui_pick_join(char *buf, size_t cap, const char *name, int as_dir)
 {
     size_t dlen = strlen(s_pick_cur);
@@ -1071,7 +1722,6 @@ static int ui_pick_join(char *buf, size_t cap, const char *name, int as_dir)
     return 0;
 }
 
-/* Rebuilds s_pick[] from s_pick_cur. */
 static int ui_pick_load(void)
 {
     SceUID      fd;
@@ -1079,6 +1729,7 @@ static int ui_pick_load(void)
     int         need_parent = !ui_pick_at_root();
     int         limit       = UI_PICK_MAX_ENTRIES - (need_parent ? 1 : 0);
     int         n           = 0;
+    int         i;
 
     fd = sceIoDopen(s_pick_cur);
     if (fd < 0) {
@@ -1089,7 +1740,7 @@ static int ui_pick_load(void)
 
         memset(&de, 0, sizeof(de));
         if (sceIoDread(fd, &de) <= 0) {
-            break;   /* 0 = end of directory, negative = error */
+            break;  /* 0 = end of directory, negative = error */
         }
         de.d_name[sizeof(de.d_name) - 1] = '\0';
         if (de.d_name[0] == '\0' ||
@@ -1097,7 +1748,7 @@ static int ui_pick_load(void)
             continue;
         }
         if (strlen(de.d_name) > (size_t)(UI_PICK_NAME_MAX - 1)) {
-            continue;   /* skip names that are too long */
+            continue;
         }
         is_dir = ((de.d_stat.st_mode & FIO_S_IFMT) == FIO_S_IFDIR);
         if (!is_dir && !ui_pick_is_image(de.d_name)) {
@@ -1118,12 +1769,17 @@ static int ui_pick_load(void)
         s_pick[0].is_dir = 1;
         n++;
     }
+    /* Cache truncation to avoid measuring names each frame. */
+    for (i = 0; i < n; i++) {
+        ui_fit_head_calc(s_pick[i].name, UI_SIZE_NAME, (float)UI_PICK_NAME_W,
+                         UI_PICK_FIT_BUF, &s_pick[i].fit);
+    }
     s_pick_count  = n;
     s_pick_parent = need_parent;
     return 0;
 }
 
-/* Moves to dir; on failure the current directory is kept. */
+/* Keep the current directory if opening dir fails. */
 static int ui_pick_enter(const char *dir)
 {
     static char prev[PSPSKY_UI_PICK_PATH_MAX];
@@ -1137,11 +1793,7 @@ static int ui_pick_enter(const char *dir)
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* File browser - drawing                                              */
-/* ------------------------------------------------------------------ */
-
-/* Fits src into max_w px, dropping the head and prefixing an ellipsis. */
+/* Preserve the path suffix when truncating. */
 static const char *ui_fit_tail(const char *src, float size, float max_w,
                                char *buf, size_t cap)
 {
@@ -1163,7 +1815,7 @@ static const char *ui_fit_tail(const char *src, float size, float max_w,
     return buf;
 }
 
-/* Measuring is per character, so this is cached until the directory changes. */
+/* Cache the measured path until the directory changes. */
 static const char *ui_pick_header_text(void)
 {
     static char src[PSPSKY_UI_PICK_PATH_MAX];
@@ -1173,68 +1825,56 @@ static const char *ui_pick_header_text(void)
         return buf;
     }
     snprintf(src, sizeof src, "%s", s_pick_cur);
-    return ui_fit_tail(s_pick_cur, UI_SIZE_HEADER, (float)(UI_SCR_W - 12),
+    return ui_fit_tail(s_pick_cur, UI_SIZE_NAME, (float)(UI_SCR_W - 28 - 10),
                        buf, sizeof buf);
 }
 
 static void ui_pick_draw(int cursor, int top)
 {
+    static const ui_button_t select = {
+        UI_ICON_CIRCLE, PSPSKY_STR_UI_KEY_SELECT, 1
+    };
     int i;
 
     ui_frame_begin();
 
-    ui_draw_rect(0, 0, UI_SCR_W, UI_HEADER_H, UI_COL_BAR);
-    ui_text(UI_SIZE_HEADER, UI_COL_TEXT, 6.0f, 14.0f, ui_pick_header_text());
+    ui_draw_header_bar(0);
+    ui_icon(UI_ICON_FOLDER, 10, 6, UI_COL_LINK);
+    ui_text(UI_SIZE_NAME, UI_COL_TEXT, 28.0f, 16.0f, ui_pick_header_text());
 
     for (i = 0; i < UI_PICK_ROWS && (top + i) < s_pick_count; i++) {
         const ui_pick_entry_t *e   = &s_pick[top + i];
-        int   y                    = UI_LIST_TOP + i * UI_LINE_H;
+        int   y                    = UI_PICK_TOP + i * UI_PICK_ROW_H;
         int   is_cursor            = ((top + i) == cursor);
-        unsigned int col;
-        char  namebuf[UI_PICK_NAME_MAX + 2];
+        unsigned int col           = UI_COL_TEXT;
+        unsigned int icol          = e->is_dir ? UI_COL_LINK : UI_COL_MED;
+        char  namebuf[UI_PICK_FIT_BUF];
 
-        /* Bar, dark text and ">" together. */
         if (is_cursor) {
-            ui_draw_rect(UI_MARGIN_X - 6, y,
-                         UI_SCR_W - (UI_MARGIN_X - 6) * 2, UI_LINE_H,
-                         UI_COL_SEL);
-            ui_text(UI_SIZE_BODY, UI_COL_SEL_TEXT, (float)UI_MARGIN_X,
-                    (float)(y + UI_BASELINE), UI_PICK_CURSOR);
-            col = UI_COL_SEL_TEXT;
-        } else {
-            col = e->is_dir ? UI_COL_NAME : UI_COL_TEXT;
+            ui_fill_rrect(6, y + 1, UI_SCR_W - 12, UI_PICK_ROW_H - 2, 4,
+                          UI_COL_SEL);
+            ui_text(UI_SIZE_NAME, UI_COL_SEL_TEXT, 11.0f, (float)(y + 13),
+                    UI_PICK_CURSOR);
+            col  = UI_COL_SEL_TEXT;
+            icol = UI_COL_SEL_TEXT;
         }
-
-        /* Indent by the marker width so all rows line up. */
-        if (e->is_dir) {
-            snprintf(namebuf, sizeof namebuf, "%s/", e->name);
-            ui_text(UI_SIZE_BODY, col, (float)(UI_MARGIN_X + 12),
-                    (float)(y + UI_BASELINE), namebuf);
-        } else {
-            ui_text(UI_SIZE_BODY, col, (float)(UI_MARGIN_X + 12),
-                    (float)(y + UI_BASELINE), e->name);
-        }
+        ui_icon(e->is_dir ? UI_ICON_FOLDER : UI_ICON_PICTURE, 22, y + 3, icol);
+        ui_text(UI_SIZE_NAME, col, (float)UI_PICK_NAME_X, (float)(y + 13),
+                ui_fit_head_apply(e->name, &e->fit, namebuf, sizeof namebuf));
     }
 
-    /* Directory with no entries other than "..". */
     if (s_pick_count - (s_pick_parent ? 1 : 0) <= 0) {
-        int y = UI_LIST_TOP + (s_pick_parent ? 1 : 0) * UI_LINE_H;
+        int y = UI_PICK_TOP + (s_pick_parent ? 1 : 0) * UI_PICK_ROW_H;
 
-        ui_text(UI_SIZE_BODY, UI_COL_DIM, (float)UI_MARGIN_X,
-                (float)(y + UI_BASELINE),
+        ui_text(UI_SIZE_NAME, UI_COL_MED, (float)UI_PICK_NAME_X, (float)(y + 13),
                 pspsky_tr(PSPSKY_STR_UI_PICK_EMPTY));
     }
 
-    ui_draw_rect(0, UI_FOOTER_Y, UI_SCR_W, UI_FOOTER_H, UI_COL_BAR);
-    ui_text(UI_SIZE_FOOTER, UI_COL_TEXT, 6.0f, (float)(UI_FOOTER_Y + 14),
-            UI_PICK_FOOTER_TEXT);
+    ui_draw_footer(UI_FOOTER_Y, &select, NULL, UI_ICON_CROSS,
+                   PSPSKY_STR_UI_KEY_CANCEL);
 
     ui_frame_end();
 }
-
-/* ------------------------------------------------------------------ */
-/* Image preview - texture upload and drawing                          */
-/* ------------------------------------------------------------------ */
 
 /* PSP texture sides must be powers of two. */
 static int ui_prev_pow2(int v)
@@ -1247,7 +1887,7 @@ static int ui_prev_pow2(int v)
     return p;
 }
 
-/* RGB888 to 0xAABBGGRR into s_prev_tex; call once, before the loop. */
+/* Convert RGB888 to GU_PSM_8888 before entering the preview loop. */
 static void ui_prev_upload(const pspsky_ui_preview_t *pv, int potw, int poth)
 {
     int x, y;
@@ -1267,7 +1907,7 @@ static void ui_prev_upload(const pspsky_ui_preview_t *pv, int potw, int poth)
             dst[pv->thumb_w] = dst[pv->thumb_w - 1];
         }
     }
-    if (poth > pv->thumb_h) {   /* same for the bottom row */
+    if (poth > pv->thumb_h) {
         memcpy(s_prev_tex + (size_t)pv->thumb_h * (size_t)potw,
                s_prev_tex + (size_t)(pv->thumb_h - 1) * (size_t)potw,
                (size_t)potw * sizeof s_prev_tex[0]);
@@ -1277,8 +1917,7 @@ static void ui_prev_upload(const pspsky_ui_preview_t *pv, int potw, int poth)
                                   (unsigned int)poth * (unsigned int)potw * 4u);
 }
 
-/* Centred and aspect-preserving; intraFont clobbers the texture state, so it
-   is re-applied every frame. */
+/* intraFont changes texture state; restore it on every draw. */
 static void ui_prev_draw_image(const pspsky_ui_preview_t *pv, int potw, int poth)
 {
     ui_tex_vertex_f_t *v;
@@ -1306,12 +1945,6 @@ static void ui_prev_draw_image(const pspsky_ui_preview_t *pv, int potw, int poth
     dx = (UI_SCR_W - dw) / 2;
     dy = UI_PREV_AREA_Y + (UI_PREV_AREA_H - dh) / 2;
 
-    /* Drawn first: ui_draw_rect disables texturing. */
-    ui_draw_rect(dx - 1, dy - 1, dw + 2, dh + 2, UI_COL_SEP);
-
-    /* Must be float (32BITF): 16-bit textured sprites drawn after
-       intraFontPrint break GE rendering on hardware. intraFont uses 32BITF
-       itself, and matching it avoids the conflict. */
     v = (ui_tex_vertex_f_t *)sceGuGetMemory(2 * sizeof(ui_tex_vertex_f_t));
     if (!v) {
         return;
@@ -1327,31 +1960,32 @@ static void ui_prev_draw_image(const pspsky_ui_preview_t *pv, int potw, int poth
     v[1].y = (float)(dy + dh);
     v[1].z = 0.0f;
 
-    /* intraFontPrint returns with GU_DEPTH_TEST enabled. */
+    /* intraFont re-enables depth testing. */
     sceGuDisable(GU_DEPTH_TEST);
     sceGuEnable(GU_TEXTURE_2D);
+    /* Upload runs outside the display list, so flush the texture cache here. */
+    sceGuTexFlush();
     sceGuTexMode(GU_PSM_8888, 0, 0, 0);
     sceGuTexImage(0, potw, poth, potw, s_prev_tex);
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
     sceGuTexFilter(GU_LINEAR, GU_LINEAR);
     sceGuTexWrap(GU_CLAMP, GU_CLAMP);
-    /* GU_TCC_RGB takes alpha from the vertex colour; these carry none. */
+    /* GU_TCC_RGB needs a color alpha; these vertices have no color field. */
     sceGuColor(0xFFFFFFFF);
     sceGuDrawArray(GU_SPRITES,
                    GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
                    2, 0, v);
+    s_tex = UI_TEX_OTHER;
 
-    /* intraFontPrint skips rebinding its texture while INTRAFONT_ACTIVE, so
-       later text would sample the image bound above. */
-    if (s_font) {
-        intraFontActivate(s_font);
-    }
+    ui_corners(UI_ICON_ICIRCLE16, dx, dy, dw, dh, UI_PREV_RADIUS, UI_COL_BG);
 }
 
-/* has_img=0 selects the fallback display. */
 static void ui_prev_draw(const pspsky_ui_preview_t *pv, int has_img,
                          int potw, int poth)
 {
+    static const ui_button_t post = {
+        UI_ICON_CIRCLE, PSPSKY_STR_UI_KEY_POST_THIS, 1
+    };
     static char  pathbuf[PSPSKY_UI_PICK_PATH_MAX + 8];
     char         info[64];
     unsigned int kb = (unsigned int)((pv->file_bytes + 1023u) / 1024u);
@@ -1359,8 +1993,9 @@ static void ui_prev_draw(const pspsky_ui_preview_t *pv, int has_img,
 
     ui_frame_begin();
 
-    ui_draw_rect(0, 0, UI_SCR_W, UI_HEADER_H, UI_COL_BAR);
-    ui_text(UI_SIZE_HEADER, UI_COL_TEXT, 6.0f, 14.0f, UI_PREV_TITLE);
+    ui_draw_header_bar(0);
+    ui_icon(UI_ICON_PICTURE, 10, 6, UI_COL_LINK);
+    ui_text_bold(UI_SIZE_TAB, UI_COL_TEXT, 28.0f, 16.0f, UI_PREV_TITLE);
 
     if (has_img) {
         ui_prev_draw_image(pv, potw, poth);
@@ -1370,18 +2005,16 @@ static void ui_prev_draw(const pspsky_ui_preview_t *pv, int has_img,
                 (float)(UI_PREV_AREA_Y + UI_PREV_AREA_H / 2 - 4),
                 UI_PREV_NO_IMAGE);
         w = ui_measure(UI_SIZE_NAME, UI_PREV_NO_IMAGE_SUB);
-        ui_text(UI_SIZE_NAME, UI_COL_DIM, ((float)UI_SCR_W - w) * 0.5f,
+        ui_text(UI_SIZE_NAME, UI_COL_MED, ((float)UI_SCR_W - w) * 0.5f,
                 (float)(UI_PREV_AREA_Y + UI_PREV_AREA_H / 2 + 18),
                 UI_PREV_NO_IMAGE_SUB);
     }
 
-    /* Path, tail-first when too wide. */
-    ui_text(UI_SIZE_NAME, UI_COL_TEXT, (float)UI_MARGIN_X,
+    ui_text(UI_SIZE_NAME, UI_COL_TEXT, 10.0f,
             (float)(UI_PREV_INFO_Y1 + UI_BASELINE),
             ui_fit_tail(pv->path, UI_SIZE_NAME, UI_PREV_INFO_W,
                         pathbuf, sizeof pathbuf));
 
-    /* Size (KB, rounded up) and source dimensions. */
     if (pv->src_w > 0 && pv->src_h > 0) {
         snprintf(info, sizeof info, "%u KB   %d x %d px",
                  kb, pv->src_w, pv->src_h);
@@ -1389,19 +2022,54 @@ static void ui_prev_draw(const pspsky_ui_preview_t *pv, int has_img,
         snprintf(info, sizeof info, "%u KB   %s", kb,
                  pspsky_tr(PSPSKY_STR_UI_PREV_DIM_UNKNOWN));
     }
-    ui_text(UI_SIZE_NAME, UI_COL_DIM, (float)UI_MARGIN_X,
+    ui_text(UI_SIZE_NAME, UI_COL_MED, 10.0f,
             (float)(UI_PREV_INFO_Y2 + UI_BASELINE), info);
 
-    ui_draw_rect(0, UI_FOOTER_Y, UI_SCR_W, UI_FOOTER_H, UI_COL_BAR);
-    ui_text(UI_SIZE_FOOTER, UI_COL_TEXT, 6.0f, (float)(UI_FOOTER_Y + 14),
-            UI_PREV_FOOTER_TEXT);
+    ui_draw_footer(UI_FOOTER_Y, &post, NULL, UI_ICON_CROSS,
+                   PSPSKY_STR_UI_KEY_RECHOOSE);
 
     ui_frame_end();
 }
 
-/* ------------------------------------------------------------------ */
-/* Public API                                                          */
-/* ------------------------------------------------------------------ */
+static void ui_build_atlas(void)
+{
+    int i;
+
+    memset(s_atlas, 0, sizeof s_atlas);
+    for (i = 0; i < UI_ATLAS_W * UI_ATLAS_ROWS / 2; i++) {
+        unsigned int lo = (unsigned int)(k_ui_atlas_a4[i] & 0x0F) * 17u;
+        unsigned int hi = (unsigned int)(k_ui_atlas_a4[i] >> 4) * 17u;
+
+        s_atlas[2 * i]     = (lo << 24) | 0x00FFFFFFu;
+        s_atlas[2 * i + 1] = (hi << 24) | 0x00FFFFFFu;
+    }
+    sceKernelDcacheWritebackRange(s_atlas, sizeof s_atlas);
+}
+
+/* Top-left corner coverage, sampled at 4x4 subpixels per pixel. */
+static void ui_build_corner_mask(void)
+{
+    const float r = (float)UI_IMG_RADIUS;
+    int         x, y, i, j;
+
+    for (y = 0; y < UI_IMG_RADIUS; y++) {
+        for (x = 0; x < UI_IMG_RADIUS; x++) {
+            int in = 0;
+
+            for (j = 0; j < 4; j++) {
+                for (i = 0; i < 4; i++) {
+                    float px = r - ((float)x + ((float)i + 0.5f) / 4.0f);
+                    float py = r - ((float)y + ((float)j + 0.5f) / 4.0f);
+
+                    if (px * px + py * py <= r * r) {
+                        in++;
+                    }
+                }
+            }
+            s_corner_a[y][x] = (unsigned char)((in * 255 + 8) / 16);
+        }
+    }
+}
 
 int pspsky_ui_init(void)
 {
@@ -1419,8 +2087,10 @@ int pspsky_ui_init(void)
     sceGuOffset(2048 - (UI_SCR_W / 2), 2048 - (UI_SCR_H / 2));
     sceGuViewport(2048, 2048, UI_SCR_W, UI_SCR_H);
     sceGuDepthRange(65535, 0);
-    /* intraFontPrint re-enables GU_DEPTH_TEST; with the GE default (NEVER)
-       everything except text would then be discarded. */
+    /*
+     * intraFont re-enables depth testing; the GE default GU_NEVER would
+     * discard later draws.
+     */
     sceGuDepthFunc(GU_ALWAYS);
     sceGuScissor(0, 0, UI_SCR_W, UI_SCR_H);
     sceGuEnable(GU_SCISSOR_TEST);
@@ -1442,9 +2112,7 @@ int pspsky_ui_init(void)
         sceGuTerm();
         return PSPSKY_E_IO;
     }
-    /* CACHE_LARGE is a 512x512 glyph cache instead of 256x256. The medium one
-       holds about 100 glyphs, so a screen full of kanji thrashes it and every
-       frame re-rasterises glyphs it just evicted. */
+    /* A 512x512 glyph cache avoids eviction on kanji-heavy screens. */
     s_font = intraFontLoad("flash0:/font/jpn0.pgf", INTRAFONT_CACHE_LARGE);
     if (!s_font) {
         printf("pspsky_ui_init: jpn0.pgf load failed, falling back to ltn0.pgf\n");
@@ -1458,15 +2126,23 @@ int pspsky_ui_init(void)
     }
     intraFontSetEncoding(s_font, INTRAFONT_STRING_UTF8);
 
+    ui_build_atlas();
+    ui_build_corner_mask();
+    s_digit_w = ui_measure(UI_SIZE_NAME, "0");
+
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
     for (i = 0; i < UI_TL_TEX_SLOTS; i++) {
         s_tl_tex_post[i] = -1;
     }
+    for (i = 0; i < UI_AV_SLOTS; i++) {
+        s_av_key[i] = NULL;
+    }
     s_tl_tex_next  = 0;
     s_prev_buttons = 0;
     s_scroll       = 0;
+    s_shell        = 0;
     s_content_h    = 0;
     s_layout_valid = 0;
     s_layout_count = 0;
@@ -1494,12 +2170,15 @@ void pspsky_ui_status(const char *msg_utf8)
         return;
     }
     ui_frame_begin();
-    ui_draw_message(msg_utf8, NULL);
+    ui_draw_status(msg_utf8);
     ui_frame_end();
 }
 
 void pspsky_ui_message(const char *msg_utf8)
 {
+    static const ui_button_t ok[] = {
+        { UI_ICON_CIRCLE, PSPSKY_STR_UI_KEY_OK, 1 }
+    };
     SceCtrlData pad;
     int         first = 1;
 
@@ -1510,13 +2189,13 @@ void pspsky_ui_message(const char *msg_utf8)
         unsigned int pressed;
 
         ui_frame_begin();
-        ui_draw_message(msg_utf8, pspsky_tr(PSPSKY_STR_UI_HINT_OK));
+        ui_draw_dialog(msg_utf8, 0, ok, 1);
         ui_frame_end();
 
         memset(&pad, 0, sizeof(pad));
         sceCtrlPeekBufferPositive(&pad, 1);
         if (first) {
-            /* Re-baseline so a button held on entry is not read as a press. */
+            /* Ignore buttons held when entering the dialog. */
             s_prev_buttons = pad.Buttons;
             first = 0;
             continue;
@@ -1531,6 +2210,10 @@ void pspsky_ui_message(const char *msg_utf8)
 
 int pspsky_ui_confirm(const char *msg_utf8)
 {
+    static const ui_button_t yes_no[] = {
+        { UI_ICON_CIRCLE, PSPSKY_STR_UI_KEY_YES, 1 },
+        { UI_ICON_CROSS,  PSPSKY_STR_UI_KEY_NO,  0 }
+    };
     SceCtrlData pad;
     int         first = 1;
 
@@ -1541,7 +2224,7 @@ int pspsky_ui_confirm(const char *msg_utf8)
         unsigned int pressed;
 
         ui_frame_begin();
-        ui_draw_message(msg_utf8, pspsky_tr(PSPSKY_STR_UI_HINT_YES_NO));
+        ui_draw_dialog(msg_utf8, 0, yes_no, 2);
         ui_frame_end();
 
         memset(&pad, 0, sizeof(pad));
@@ -1564,6 +2247,11 @@ int pspsky_ui_confirm(const char *msg_utf8)
 
 pspsky_ui_compose_choice_t pspsky_ui_compose_confirm(const char *msg_utf8)
 {
+    static const ui_button_t choices[] = {
+        { UI_ICON_CIRCLE, PSPSKY_STR_UI_KEY_POST,       1 },
+        { UI_ICON_SQUARE, PSPSKY_STR_UI_KEY_POST_IMAGE, 0 },
+        { UI_ICON_CROSS,  PSPSKY_STR_UI_KEY_CANCEL,     0 }
+    };
     SceCtrlData pad;
     int         first = 1;
 
@@ -1574,13 +2262,13 @@ pspsky_ui_compose_choice_t pspsky_ui_compose_confirm(const char *msg_utf8)
         unsigned int pressed;
 
         ui_frame_begin();
-        ui_draw_message(msg_utf8, UI_COMPOSE_HINT);
+        ui_draw_dialog(msg_utf8, 1, choices, 3);
         ui_frame_end();
 
         memset(&pad, 0, sizeof(pad));
         sceCtrlPeekBufferPositive(&pad, 1);
         if (first) {
-            /* Re-baseline so a button held on entry is not read as a press. */
+            /* Ignore buttons held when entering the dialog. */
             s_prev_buttons = pad.Buttons;
             first = 0;
             continue;
@@ -1602,7 +2290,7 @@ pspsky_ui_compose_choice_t pspsky_ui_compose_confirm(const char *msg_utf8)
 int pspsky_ui_pick_jpeg(const char *start_dir, char *out_path, size_t out_cap)
 {
     SceCtrlData  pad;
-    unsigned int hold_dir    = 0;   /* direction key currently repeating */
+    unsigned int hold_dir    = 0;
     int          hold_frames = 0;
     int          cursor      = 0;
     int          top         = 0;
@@ -1613,10 +2301,9 @@ int pspsky_ui_pick_jpeg(const char *start_dir, char *out_path, size_t out_cap)
     }
     out_path[0] = '\0';
     if (!s_inited) {
-        return PSPSKY_E_ARG;   /* only callable after pspsky_ui_init() */
+        return PSPSKY_E_ARG;
     }
 
-    /* Fall back to "ms0:/" if start_dir cannot be opened. */
     if (start_dir == NULL || start_dir[0] == '\0' ||
         ui_pick_set_dir(start_dir) != 0 || ui_pick_load() != 0) {
         if (ui_pick_set_dir("ms0:/") != 0 || ui_pick_load() != 0) {
@@ -1628,7 +2315,6 @@ int pspsky_ui_pick_jpeg(const char *start_dir, char *out_path, size_t out_cap)
         unsigned int buttons, pressed;
         int          step = 0;
 
-        /* Keep the window following the cursor. */
         if (cursor < top) {
             top = cursor;
         }
@@ -1655,7 +2341,6 @@ int pspsky_ui_pick_jpeg(const char *start_dir, char *out_path, size_t out_cap)
         pressed        = buttons & ~s_prev_buttons;
         s_prev_buttons = buttons;
 
-        /* Held: repeat every UI_PICK_REPEAT_RATE frames after the delay. */
         if (pressed & PSP_CTRL_UP) {
             step        = -1;
             hold_dir    = PSP_CTRL_UP;
@@ -1685,7 +2370,6 @@ int pspsky_ui_pick_jpeg(const char *start_dir, char *out_path, size_t out_cap)
             }
         }
 
-        /* --- Circle: confirm (one action per frame) ----------------- */
         if ((pressed & PSP_CTRL_CIRCLE) && s_pick_count > 0 &&
             cursor >= 0 && cursor < s_pick_count) {
             const ui_pick_entry_t *e = &s_pick[cursor];
@@ -1702,7 +2386,7 @@ int pspsky_ui_pick_jpeg(const char *start_dir, char *out_path, size_t out_cap)
                 if (ui_pick_enter(s_pick_path) != 0) {
                     pspsky_ui_message(pspsky_tr(PSPSKY_STR_UI_MSG_DIR_OPEN_FAIL));
                 } else {
-                    cursor = 0;   /* reset cursor and window to the top */
+                    cursor = 0;
                     top    = 0;
                 }
                 first       = 1;
@@ -1711,7 +2395,6 @@ int pspsky_ui_pick_jpeg(const char *start_dir, char *out_path, size_t out_cap)
                 continue;
             }
 
-            /* File: return the full path. */
             if (ui_pick_join(s_pick_path, sizeof s_pick_path, e->name, 0) != 0 ||
                 strlen(s_pick_path) + 1 > out_cap) {
                 pspsky_ui_message(pspsky_tr(PSPSKY_STR_UI_MSG_PATH_TOO_LONG));
@@ -1722,7 +2405,6 @@ int pspsky_ui_pick_jpeg(const char *start_dir, char *out_path, size_t out_cap)
             return PSPSKY_OK;
         }
 
-        /* --- Cross: cancel the browser entirely -------------------- */
         if (pressed & PSP_CTRL_CROSS) {
             out_path[0] = '\0';
             return PSPSKY_E_CANCELLED;
@@ -1742,7 +2424,6 @@ int pspsky_ui_preview_image(const pspsky_ui_preview_t *pv)
         return 0;
     }
 
-    /* Built once; out-of-range dimensions fall back to no image. */
     if (pv->rgb != NULL &&
         pv->thumb_w >= 1 && pv->thumb_w <= UI_PREV_MAX_DIM &&
         pv->thumb_h >= 1 && pv->thumb_h <= UI_PREV_MAX_DIM) {
@@ -1760,7 +2441,7 @@ int pspsky_ui_preview_image(const pspsky_ui_preview_t *pv)
         memset(&pad, 0, sizeof(pad));
         sceCtrlPeekBufferPositive(&pad, 1);
         if (first) {
-            /* Re-baseline so a button held on entry is not read as a press. */
+            /* Ignore buttons held when entering the preview. */
             s_prev_buttons = pad.Buttons;
             first = 0;
             continue;
@@ -1768,10 +2449,10 @@ int pspsky_ui_preview_image(const pspsky_ui_preview_t *pv)
         pressed        = pad.Buttons & ~s_prev_buttons;
         s_prev_buttons = pad.Buttons;
         if (pressed & PSP_CTRL_CIRCLE) {
-            return 1;   /* Circle: post with this image */
+            return 1;
         }
         if (pressed & PSP_CTRL_CROSS) {
-            return 0;   /* Cross: pick a different one */
+            return 0;
         }
     }
 }
@@ -1781,13 +2462,15 @@ void pspsky_ui_timeline_invalidate(int reset_scroll)
     int i;
 
     s_layout_valid = 0;
-    /* The posts array is about to change and main may free the rgb buffers, so
-       no slot may go on claiming to hold a given post index. */
     for (i = 0; i < UI_TL_TEX_SLOTS; i++) {
         s_tl_tex_post[i] = -1;
     }
+    for (i = 0; i < UI_AV_SLOTS; i++) {
+        s_av_key[i] = NULL;
+    }
     if (reset_scroll) {
         s_scroll = 0;
+        s_shell  = 0;
     }
 }
 
@@ -1796,7 +2479,8 @@ pspsky_ui_action_t pspsky_ui_timeline_frame(const pspsky_ui_timeline_view_t *vie
     pspsky_ui_action_t act = PSPSKY_UI_ACT_NONE;
     SceCtrlData        pad;
     unsigned int       buttons, pressed;
-    int                max_scroll, at_bottom;
+    int                max_scroll, at_bottom, prev_scroll, step, tilt;
+    int                header_y, footer_y;
     int                n, i;
 
     if (!s_inited || !view) {
@@ -1804,28 +2488,38 @@ pspsky_ui_action_t pspsky_ui_timeline_frame(const pspsky_ui_timeline_view_t *vie
     }
 
     n = ui_clamp_count(view->count);
-    if (!s_layout_valid || s_layout_count != n) {
+    if (!s_layout_valid || s_layout_count != n ||
+        s_layout_more != (view->has_more != 0)) {
         ui_rebuild_layout(view);
     }
 
-    /* --- input ----------------------------------------------------- */
     memset(&pad, 0, sizeof(pad));
     sceCtrlPeekBufferPositive(&pad, 1);
     buttons        = pad.Buttons;
     pressed        = buttons & ~s_prev_buttons;
     s_prev_buttons = buttons;
 
-    max_scroll = ui_max_scroll();
+    max_scroll  = ui_max_scroll();
+    prev_scroll = s_scroll;
+    if (buttons & (PSP_CTRL_UP | PSP_CTRL_DOWN)) {
+        s_hold++;
+    } else {
+        s_hold = 0;
+    }
+    step = (s_hold > UI_SCROLL_HOLD) ? UI_SCROLL_FAST : UI_SCROLL_STEP;
     if (buttons & PSP_CTRL_UP) {
-        s_scroll -= UI_SCROLL_STEP;
+        s_scroll -= step;
     }
     if (buttons & PSP_CTRL_DOWN) {
-        s_scroll += UI_SCROLL_STEP;
+        s_scroll += step;
     }
-    if (pad.Ly < (128 - UI_ANALOG_DEAD)) {
-        s_scroll -= UI_SCROLL_STEP;
-    } else if (pad.Ly > (128 + UI_ANALOG_DEAD)) {
-        s_scroll += UI_SCROLL_STEP;
+    tilt = (int)pad.Ly - 128;
+    if (tilt > UI_ANALOG_DEAD) {
+        s_scroll += 1 + (tilt - UI_ANALOG_DEAD) * (UI_ANALOG_MAX - 1) /
+                        (127 - UI_ANALOG_DEAD);
+    } else if (tilt < -UI_ANALOG_DEAD) {
+        s_scroll -= 1 + (-tilt - UI_ANALOG_DEAD) * (UI_ANALOG_MAX - 1) /
+                        (128 - UI_ANALOG_DEAD);
     }
     if (s_scroll > max_scroll) {
         s_scroll = max_scroll;
@@ -1835,7 +2529,14 @@ pspsky_ui_action_t pspsky_ui_timeline_frame(const pspsky_ui_timeline_view_t *vie
     }
     at_bottom = (s_scroll >= max_scroll);
 
-    /* --- action selection (one action per frame) ------------------- */
+    s_shell += s_scroll - prev_scroll;
+    if (s_shell > UI_HEADER_H) {
+        s_shell = UI_HEADER_H;
+    }
+    if (s_shell < 0 || s_scroll == 0) {
+        s_shell = 0;
+    }
+
     if (((pressed & PSP_CTRL_RTRIGGER) ||
          (at_bottom && (pressed & PSP_CTRL_DOWN))) && view->has_more) {
         act = PSPSKY_UI_ACT_LOAD_OLDER;
@@ -1847,38 +2548,54 @@ pspsky_ui_action_t pspsky_ui_timeline_frame(const pspsky_ui_timeline_view_t *vie
         act = PSPSKY_UI_ACT_QUIT;
     }
 
-    /* --- drawing --------------------------------------------------- */
     ui_frame_begin();
+
+    header_y     = -s_shell;
+    footer_y     = UI_FOOTER_Y + s_shell * UI_FOOTER_H / UI_HEADER_H;
+    s_vis_top    = header_y + UI_HEADER_H;
+    s_vis_bottom = footer_y;
 
     if (n == 0 || view->posts == NULL) {
         const char *empty = pspsky_tr(PSPSKY_STR_UI_TL_EMPTY);
         float       w     = ui_measure(UI_SIZE_MSG, empty);
 
-        ui_text(UI_SIZE_MSG, UI_COL_DIM, ((float)UI_SCR_W - w) * 0.5f,
-                (float)(UI_LIST_TOP + UI_LIST_H / 2), empty);
+        ui_text(UI_SIZE_MSG, UI_COL_MED, ((float)UI_SCR_W - w) * 0.5f,
+                (float)(UI_SCR_H / 2), empty);
     } else {
         for (i = 0; i < n; i++) {
-            int top    = UI_LIST_TOP + s_post_top[i] - s_scroll;
-            int bottom = UI_LIST_TOP + s_post_top[i + 1] - s_scroll;
+            int top    = UI_PAD_TOP + s_post_top[i] - s_scroll;
+            int bottom = UI_PAD_TOP + s_post_top[i + 1] - s_scroll;
 
-            if (bottom < UI_LIST_TOP) {
+            if (bottom <= s_vis_top) {
                 continue;
             }
-            if (top > UI_LIST_BOTTOM) {
+            if (top >= s_vis_bottom) {
                 break;
             }
             /* intraFont may change the scissor. */
-            sceGuScissor(0, UI_LIST_TOP, UI_SCR_W, UI_LIST_H);
+            sceGuScissor(0, s_vis_top, UI_SCR_W, s_vis_bottom - s_vis_top);
             ui_draw_post(&view->posts[i], i, top, view->now_unix,
-                         ui_tl_image(view, i));
+                         ui_tl_images(view, i), ui_avatar(view, i));
+        }
+        if (s_layout_more) {
+            int y = UI_PAD_TOP + s_post_top[n] - s_scroll;
+
+            if (ui_visible(y, UI_END_H)) {
+                sceGuScissor(0, s_vis_top, UI_SCR_W, s_vis_bottom - s_vis_top);
+                ui_draw_end_row(y);
+            }
         }
         sceGuScissor(0, 0, UI_SCR_W, UI_SCR_H);
         ui_draw_scrollbar();
     }
 
     sceGuScissor(0, 0, UI_SCR_W, UI_SCR_H);
-    ui_draw_header(view->my_handle);
-    ui_draw_footer();
+    if (s_vis_top > 0) {
+        ui_draw_tl_header(header_y, view->my_handle);
+    }
+    if (footer_y < UI_SCR_H) {
+        ui_draw_tl_footer(footer_y, view->has_more);
+    }
 
     ui_frame_end();
 

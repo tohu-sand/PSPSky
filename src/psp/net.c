@@ -1,8 +1,4 @@
-/*
- * PSPSky - PSP network stack init and access point connection.
- * The init order below is mandatory: modules, then net, inet, resolver, apctl.
- * Rollback and teardown must run in exactly the reverse order.
- */
+/* Initialize modules, net, inet, resolver, then apctl; tear down in reverse. */
 
 #include <stdio.h>
 
@@ -17,16 +13,11 @@
 #include "pspsky/net.h"
 #include "pspsky/strings.h"
 
-/* APCTL state polling interval. */
-#define POLL_INTERVAL_US 100000 /* 100ms */
+#define POLL_INTERVAL_US 100000
 #define POLL_INTERVAL_MS 100
 
-/* Guards connect and term. */
 static int g_net_inited = 0;
-/* Set once connect has reached GOT_IP. */
 static int g_connected = 0;
-
-/* ----------------------------------------------------------------- init */
 
 int pspsky_net_init(void)
 {
@@ -78,7 +69,6 @@ int pspsky_net_init(void)
     g_connected = 0;
     return PSPSKY_OK;
 
-    /* Unwind only what succeeded, in reverse order. */
 rollback_resolver:
     sceNetResolverTerm();
 rollback_inet:
@@ -92,9 +82,7 @@ rollback_mod_common:
     return PSPSKY_E_NET_INIT;
 }
 
-/* -------------------------------------------------------------- connect */
-
-/* Progress text, or NULL; static, so callers can dedupe by pointer. */
+/* Strings have static storage, allowing pointer comparison for deduplication. */
 static const char *state_message(int state)
 {
     switch (state) {
@@ -130,7 +118,7 @@ int pspsky_net_connect(int conf_index, int timeout_sec,
         return PSPSKY_E_NET_CONNECT;
     }
     if (timeout_sec <= 0) {
-        timeout_sec = 1; /* poll for at least one second */
+        timeout_sec = 1;
     }
     timeout_ms = timeout_sec * 1000;
 
@@ -196,8 +184,6 @@ int pspsky_net_connect(int conf_index, int timeout_sec,
     return PSPSKY_E_NET_CONNECT;
 }
 
-/* ---------------------------------------------------------------- state */
-
 int pspsky_net_is_connected(void)
 {
     int state = PSP_NET_APCTL_STATE_DISCONNECTED;
@@ -223,14 +209,12 @@ void pspsky_net_disconnect(void)
     }
     if (state == PSP_NET_APCTL_STATE_DISCONNECTED) {
         g_connected = 0;
-        return; /* nothing to do when not connected */
+        return;
     }
 
     sceNetApctlDisconnect();
     g_connected = 0;
 }
-
-/* ------------------------------------------------------------- teardown */
 
 void pspsky_net_term(void)
 {
@@ -240,7 +224,6 @@ void pspsky_net_term(void)
 
     pspsky_net_disconnect();
 
-    /* Reverse of init; individual failures are ignored. */
     sceNetApctlTerm();
     sceNetResolverTerm();
     sceNetInetTerm();

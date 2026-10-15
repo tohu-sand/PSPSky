@@ -1,14 +1,8 @@
-/*
- * JPEG dimension parser: reads width/height from the SOF segment without
- * touching Huffman decoding or the DCT. Every read is bounds-checked first.
- */
-
 #include <stddef.h>
 
 #include "pspsky/error.h"
 #include "pspsky/jpeg.h"
 
-/* Markers (the single byte after the preceding 0xFF) */
 #define JPEG_MARK_TEM  0x01  /* has no length field */
 #define JPEG_MARK_RST0 0xD0  /* 0xD0..0xD7: have no length field */
 #define JPEG_MARK_RST7 0xD7
@@ -19,7 +13,7 @@
 #define JPEG_MARK_SOF1 0xC1
 #define JPEG_MARK_SOF2 0xC2
 
-/* Caller must have bounds-checked */
+/* The caller must provide at least two bytes. */
 static unsigned int be16(const unsigned char *p)
 {
     return ((unsigned int)p[0] << 8) | (unsigned int)p[1];
@@ -34,7 +28,6 @@ int pspsky_jpeg_dimensions(const unsigned char *data, size_t len,
         return PSPSKY_E_ARG;
     }
 
-    /* Anything not starting with SOI (FF D8) is not treated as JPEG */
     if (len < 4 || data[0] != 0xFF || data[1] != JPEG_MARK_SOI) {
         return PSPSKY_E_PARSE;
     }
@@ -45,12 +38,12 @@ int pspsky_jpeg_dimensions(const unsigned char *data, size_t len,
         unsigned int seglen;
 
         if (pos >= len) {
-            return PSPSKY_E_PARSE;      /* end of data before any SOF */
+            return PSPSKY_E_PARSE;
         }
         if (data[pos] != 0xFF) {
-            return PSPSKY_E_PARSE;      /* marker boundary is corrupt */
+            return PSPSKY_E_PARSE;
         }
-        /* Any number of 0xFF fill bytes may follow */
+        /* JPEG allows repeated 0xFF fill bytes. */
         while (data[pos] == 0xFF) {
             pos++;
             if (pos >= len) {
@@ -71,11 +64,10 @@ int pspsky_jpeg_dimensions(const unsigned char *data, size_t len,
             return PSPSKY_E_PARSE;
         }
 
-        /* Everything below is a segment carrying a 2-byte length field */
         if (pos + 2 > len) {
             return PSPSKY_E_PARSE;
         }
-        seglen = be16(&data[pos]);      /* includes the 2 bytes of the length field itself */
+        seglen = be16(&data[pos]);  /* includes the two-byte length field */
         if (seglen < 2 || pos + (size_t)seglen > len) {
             return PSPSKY_E_PARSE;
         }
@@ -85,12 +77,11 @@ int pspsky_jpeg_dimensions(const unsigned char *data, size_t len,
             unsigned int h;
             unsigned int w;
 
-            /* Payload = precision 1 + height 2 + width 2, so at least 5 bytes.
-               Since seglen >= 7, pos+6 is always <= pos+seglen-1 (in range). */
+            /* The payload needs one precision byte and two bytes per dimension. */
             if ((size_t)(seglen - 2) < 5) {
                 return PSPSKY_E_PARSE;
             }
-            h = be16(&data[pos + 3]);   /* data[pos+2] is the precision byte */
+            h = be16(&data[pos + 3]);  /* data[pos+2] is the precision byte */
             w = be16(&data[pos + 5]);
             if (w == 0 || h == 0) {
                 return PSPSKY_E_PARSE;
@@ -100,7 +91,6 @@ int pspsky_jpeg_dimensions(const unsigned char *data, size_t len,
             return PSPSKY_OK;
         }
 
-        /* Skip unsupported SOF variants (0xC3 etc.) and APPn/DQT/DHT/COM */
         pos += (size_t)seglen;
     }
 }

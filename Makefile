@@ -1,6 +1,5 @@
 TARGET = PSPSKY
 
-# libwebp decoder sources, compiled from the vendored tree as-is.
 WEBP_OBJS = $(patsubst %.c,%.o,\
             $(wildcard vendor/libwebp/src/dec/*.c) \
             $(wildcard vendor/libwebp/src/dsp/*.c) \
@@ -21,13 +20,9 @@ CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS  = $(CFLAGS)
 
 LIBDIR  =
-# mbedTLS checks certificate dates with time(), but the PSP newlib time() does
-# not return true UTC, so valid certificates are rejected (curl:60). --wrap
-# redirects it to __wrap_time() in src/psp/main.c, which reads the RTC.
+# Use RTC-based UTC for TLS certificate checks; PSP newlib time() is not UTC.
 LDFLAGS = -Wl,--wrap=time
-# -lcglue must precede the PSP stub libraries. Linked last, its sce* stubs are
-# pulled in over two passes and land discontiguous in .sceStub.text, corrupting
-# the import table and producing a PRX that will not load.
+# Keep cglue before PSP stubs to preserve a contiguous PRX import table.
 LIBS = -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz \
        -lintrafont \
        -lcglue \

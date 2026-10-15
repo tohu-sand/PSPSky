@@ -1,11 +1,12 @@
-/* UTF-8 / UCS-2 conversion helpers. Portable C99, libc only. */
 #ifndef PSPSKY_UTF8_H
 #define PSPSKY_UTF8_H
 
 #include <stddef.h>
 
-/* Decodes one code point and advances *p. An invalid byte yields 0xFFFD and
-   advances exactly one byte, so callers always make progress. */
+/*
+ * Decodes one code point and advances *p. An invalid byte yields 0xFFFD and
+ * advances exactly one byte, so callers always make progress.
+ */
 unsigned int pspsky_utf8_next(const char **p);
 
 /* Non-BMP code points become 0xFFFD; out_cap counts elements including the NUL */

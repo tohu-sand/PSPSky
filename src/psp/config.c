@@ -1,9 +1,4 @@
-/*
- * PSPSky - config file I/O (key=value: identifier, password, optional
- * lang and images).
- * Credentials are stored in plain text on the Memory Stick: use an app
- * password, never the account password.
- */
+/* Credentials are stored in plaintext; use a Bluesky app password. */
 
 #include <stdio.h>
 #include <string.h>
@@ -18,8 +13,7 @@
 #define KEY_LANG       "lang"
 #define KEY_IMAGES     "images"
 
-/* Every return path must leave a fully defined struct, so the defaults are
-   applied both on entry and before any late wipe. */
+/* Load failures must leave a fully initialized config. */
 static void set_defaults(pspsky_config_t *out)
 {
     memset(out, 0, sizeof *out);
@@ -77,7 +71,6 @@ int pspsky_config_load(const char *path, pspsky_config_t *out)
             bad = 1;
         }
 
-        /* Skip a UTF-8 BOM. */
         if (first_line &&
             (unsigned char)p[0] == 0xEF &&
             (unsigned char)p[1] == 0xBB &&
@@ -90,7 +83,7 @@ int pspsky_config_load(const char *path, pspsky_config_t *out)
 
         eq = strchr(p, '=');
         if (eq == NULL) {
-            continue; /* ignore lines that are not key=value */
+            continue;
         }
         *eq = '\0';
 
@@ -104,19 +97,16 @@ int pspsky_config_load(const char *path, pspsky_config_t *out)
                 bad = 1;
             }
         } else if (strcmp(p, KEY_LANG) == 0) {
-            /* Only exact "ja" or "en"; anything else is ignored, not an error. */
             if (strcmp(eq + 1, "ja") == 0 || strcmp(eq + 1, "en") == 0) {
                 memcpy(out->lang, eq + 1, 3);
             }
         } else if (strcmp(p, KEY_IMAGES) == 0) {
-            /* Only "off" and "on" carry meaning; anything else is ignored. */
             if (strcmp(eq + 1, "off") == 0) {
                 out->show_images = 0;
             } else if (strcmp(eq + 1, "on") == 0) {
                 out->show_images = 1;
             }
         }
-        /* Unknown keys are ignored. */
     }
 
     if (ferror(fp)) {
@@ -158,7 +148,6 @@ int pspsky_config_save(const char *path, const pspsky_config_t *cfg)
         return PSPSKY_E_IO;
     }
 
-    /* Omit the line entirely when lang is unspecified. */
     if (cfg->lang[0] != '\0') {
         n = fprintf(fp, KEY_LANG "=%.*s\n",
                     (int)(sizeof cfg->lang - 1), cfg->lang);

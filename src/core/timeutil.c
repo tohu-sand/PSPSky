@@ -1,6 +1,6 @@
-/* Time conversion utilities. Everything is UTC, computed with Howard Hinnant's
- * days_from_civil / civil_from_days: timegm is not portable and mktime and
- * localtime depend on a local timezone the PSP does not reliably provide.
+/*
+ * Use Howard Hinnant's civil-date algorithms for UTC conversion.
+ * The PSP does not reliably provide a local timezone, and timegm is not portable.
  */
 
 #include <stdio.h>
@@ -10,10 +10,6 @@
 #include "pspsky/strings.h"
 
 #define SECS_PER_DAY  86400LL
-
-/* ------------------------------------------------------------------ */
-/* Internal helpers                                                    */
-/* ------------------------------------------------------------------ */
 
 /* C99's / truncates toward zero, so negative epochs need real floor division */
 static long long floor_div(long long a, long long b)
@@ -37,13 +33,13 @@ static void civil_from_days(long long z, int *out_y, int *out_m, int *out_d)
 
     z += 719468;
     era = (z >= 0 ? z : z - 146096) / 146097;
-    doe = z - era * 146097;                                     /* [0, 146096] */
-    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; /* [0, 399]    */
+    doe = z - era * 146097;  /* [0, 146096] */
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;  /* [0, 399] */
     y   = yoe + era * 400;
-    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);              /* [0, 365]    */
-    mp  = (5 * doy + 2) / 153;                                  /* [0, 11]     */
-    d   = doy - (153 * mp + 2) / 5 + 1;                         /* [1, 31]     */
-    m   = mp + (mp < 10 ? 3 : -9);                              /* [1, 12]     */
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);  /* [0, 365] */
+    mp  = (5 * doy + 2) / 153;  /* [0, 11] */
+    d   = doy - (153 * mp + 2) / 5 + 1;  /* [1, 31] */
+    m   = mp + (mp < 10 ? 3 : -9);  /* [1, 12] */
     if (m <= 2) {
         y++;
     }
@@ -52,10 +48,6 @@ static void civil_from_days(long long z, int *out_y, int *out_m, int *out_d)
     *out_m = (int)m;
     *out_d = (int)d;
 }
-
-/* ------------------------------------------------------------------ */
-/* Public API                                                          */
-/* ------------------------------------------------------------------ */
 
 long long pspsky_civil_to_unix(int year, int month, int day,
                                int hour, int min, int sec)
@@ -69,9 +61,9 @@ long long pspsky_civil_to_unix(int year, int month, int day,
         y -= 1;
     }
     era = (y >= 0 ? y : y - 399) / 400;
-    yoe = y - era * 400;                                        /* [0, 399]    */
-    doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;       /* [0, 365]    */
-    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;                /* [0, 146096] */
+    yoe = y - era * 400;  /* [0, 399] */
+    doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;  /* [0, 365] */
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;  /* [0, 146096] */
     days = era * 146097 + doe - 719468;
 
     return days * SECS_PER_DAY
@@ -101,7 +93,7 @@ long long pspsky_iso8601_parse(const char *s)
     if (consumed <= 0) {
         return -1;
     }
-    /* Range validation */
+
     if (y < 0 || mo < 1 || mo > 12 || d < 1 || d > 31) {
         return -1;
     }
@@ -111,7 +103,6 @@ long long pspsky_iso8601_parse(const char *s)
 
     p = s + consumed;
 
-    /* Skip fractional seconds (truncated) */
     if (*p == '.') {
         p++;
         if (!is_digit_c((unsigned char)*p)) {
@@ -151,12 +142,11 @@ long long pspsky_iso8601_parse(const char *s)
             return -1;
         }
         off = (long long)oh * 3600LL + (long long)om * 60LL;
-        /* Convert the written local time to UTC */
+
         t = (sign == '+') ? (t - off) : (t + off);
         return t;
     }
 
-    /* Anything that is neither Z nor an offset, including a bare NUL, is invalid */
     return -1;
 }
 
@@ -171,7 +161,7 @@ int pspsky_iso8601_format(long long unix_utc, char *buf, size_t bufsz)
     }
 
     days = floor_div(unix_utc, SECS_PER_DAY);
-    secs = unix_utc - days * SECS_PER_DAY;   /* [0, 86399] */
+    secs = unix_utc - days * SECS_PER_DAY;  /* [0, 86399] */
     civil_from_days(days, &y, &mo, &d);
 
     hh = (int)(secs / 3600);
@@ -183,7 +173,7 @@ int pspsky_iso8601_format(long long unix_utc, char *buf, size_t bufsz)
     return PSPSKY_OK;
 }
 
-/* Bucket logic is language independent; only the wording is looked up */
+/* Relative times round down; a month is 30 days. */
 static int format_relative_lang(pspsky_lang_t lang,
                                 long long post_unix, long long now_unix,
                                 char *buf, size_t bufsz)
@@ -201,22 +191,33 @@ static int format_relative_lang(pspsky_lang_t lang,
 
     diff = now_unix - post_unix;
 
-    if (diff < 60LL) {
-        /* Future-dated posts (negative diff) also count as "just now" */
+    if (diff < 5LL) {
+        /* Future-dated posts (negative diff) also count as "now" */
         snprintf(buf, bufsz, "%s", pspsky_tr_lang(lang, PSPSKY_STR_TIME_JUST_NOW));
+    } else if (diff < 60LL) {
+        snprintf(buf, bufsz, pspsky_tr_lang(lang, PSPSKY_STR_TIME_SEC_AGO),
+                 (int)diff);
     } else if (diff < 3600LL) {
         snprintf(buf, bufsz, pspsky_tr_lang(lang, PSPSKY_STR_TIME_MIN_AGO),
                  (int)(diff / 60LL));
     } else if (diff < 86400LL) {
         snprintf(buf, bufsz, pspsky_tr_lang(lang, PSPSKY_STR_TIME_HOUR_AGO),
                  (int)(diff / 3600LL));
-    } else if (diff < 7LL * 86400LL) {
+    } else if (diff < 30LL * 86400LL) {
         snprintf(buf, bufsz, pspsky_tr_lang(lang, PSPSKY_STR_TIME_DAY_AGO),
                  (int)(diff / 86400LL));
+    } else if (diff < 12LL * 30LL * 86400LL) {
+        snprintf(buf, bufsz, pspsky_tr_lang(lang, PSPSKY_STR_TIME_MONTH_AGO),
+                 (int)(diff / (30LL * 86400LL)));
     } else {
         int y = 0, mo = 0, d = 0;
         civil_from_days(floor_div(post_unix, SECS_PER_DAY), &y, &mo, &d);
-        snprintf(buf, bufsz, "%04d/%02d/%02d", y, mo, d);
+
+        if (lang == PSPSKY_LANG_EN) {
+            snprintf(buf, bufsz, "%d/%d/%d", mo, d, y);
+        } else {
+            snprintf(buf, bufsz, "%d/%d/%d", y, mo, d);
+        }
     }
 
     return PSPSKY_OK;

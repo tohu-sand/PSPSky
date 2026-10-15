@@ -1,15 +1,13 @@
-/* Streaming PNG thumbnail decoding; the only core file that may include zlib.
- *
- * No full-resolution buffer is ever allocated, only two row buffers (~128KB
- * worst case) plus the output; the PSP's memory limits make this mandatory.
- * Non-interlaced only; alpha and tRNS are ignored and CRCs are not verified.
+/*
+ * Keep only two decoded rows (up to 128 KiB) plus the output in memory.
+ * A full-resolution buffer exceeds PSP memory limits.
  */
 
 #include "pspsky/png.h"
 
 #include "pspsky/error.h"
 
-/* Makes next_in const, so no const-stripping cast is needed */
+/* Keep zlib input pointers const. */
 #define ZLIB_CONST 1
 #include <zlib.h>
 
@@ -17,31 +15,28 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* PLTE holds at most 256 colors */
 #define PNG_MAX_PLTE_ENTRIES 256
 
-/* All decoder state; no globals, so decoding is reentrant */
 typedef struct {
     int w;
     int h;
-    int depth;              /* 8 or 16 */
-    int color;              /* 0/2/3/4/6 */
-    int n;                  /* decimation factor, >= 1 */
+    int depth;  /* 8 or 16 */
+    int color;  /* 0/2/3/4/6 */
+    int n;  /* decimation factor, >= 1 */
     int thumb_w;
     int thumb_h;
-    size_t bpp;             /* channels * depth/8 */
-    size_t row_bytes;       /* 1 + w * bpp; the leading byte is the filter type */
-    unsigned char *prev;    /* previous row, already unfiltered */
+    size_t bpp;  /* channels * depth/8 */
+    size_t row_bytes;  /* 1 + w * bpp; the leading byte is the filter type */
+    unsigned char *prev;  /* previous row, already unfiltered */
     unsigned char *cur;
-    size_t filled;          /* bytes accumulated in cur */
-    int y;                  /* next row to complete */
+    size_t filled;  /* bytes accumulated in cur */
+    int y;  /* next row to complete */
     unsigned char *out;
     unsigned char plte[PNG_MAX_PLTE_ENTRIES * 3];
     int plte_entries;
     int have_plte;
 } png_dec_t;
 
-/* Read a big-endian 32-bit value */
 static unsigned long png_thumb_be32(const unsigned char *p)
 {
     return ((unsigned long)p[0] << 24) |
@@ -50,7 +45,6 @@ static unsigned long png_thumb_be32(const unsigned char *p)
            (unsigned long)p[3];
 }
 
-/* Paeth predictor, per the PNG specification */
 static int png_paeth(int a, int b, int c)
 {
     int p = a + b - c;
@@ -71,7 +65,6 @@ static int png_paeth(int a, int b, int c)
     return c;
 }
 
-/* 0 if unsupported */
 static int png_channels_of(int color)
 {
     switch (color) {
@@ -94,25 +87,25 @@ static int png_unfilter_row(png_dec_t *d)
     size_t i;
 
     switch (cur[0]) {
-    case 0: /* None */
+    case 0:  /* None */
         break;
-    case 1: /* Sub */
+    case 1:  /* Sub */
         for (i = 1u + bpp; i < rb; i++) {
             cur[i] = (unsigned char)(cur[i] + cur[i - bpp]);
         }
         break;
-    case 2: /* Up */
+    case 2:  /* Up */
         for (i = 1u; i < rb; i++) {
             cur[i] = (unsigned char)(cur[i] + prev[i]);
         }
         break;
-    case 3: /* Average */
+    case 3:  /* Average */
         for (i = 1u; i < rb; i++) {
             int a = (i > bpp) ? (int)cur[i - bpp] : 0;
             cur[i] = (unsigned char)(cur[i] + ((a + (int)prev[i]) / 2));
         }
         break;
-    case 4: /* Paeth */
+    case 4:  /* Paeth */
         for (i = 1u; i < rb; i++) {
             int a = (i > bpp) ? (int)cur[i - bpp] : 0;
             int b = (int)prev[i];
@@ -120,7 +113,7 @@ static int png_unfilter_row(png_dec_t *d)
             cur[i] = (unsigned char)(cur[i] + png_paeth(a, b, c));
         }
         break;
-    default: /* filter types 5 and above are invalid */
+    default:
         return PSPSKY_E_PARSE;
     }
     return PSPSKY_OK;
@@ -140,7 +133,7 @@ static int png_sample_row(png_dec_t *d, int ty)
         unsigned char b;
 
         switch (d->color) {
-        case 0:  /* gray; at both depths the first byte is the high byte */
+        case 0:  /* gray; use the high byte for 16-bit samples */
         case 4:  /* gray + alpha (alpha ignored) */
             r = cur[o];
             g = r;
@@ -158,7 +151,7 @@ static int png_sample_row(png_dec_t *d, int ty)
                 b = cur[o + 2u];
             }
             break;
-        case 3: { /* palette */
+        case 3: {  /* palette */
             int idx = (int)cur[o];
             if (idx >= d->plte_entries) {
                 return PSPSKY_E_PARSE;
@@ -179,7 +172,6 @@ static int png_sample_row(png_dec_t *d, int ty)
     return PSPSKY_OK;
 }
 
-/* Unfilter, sample if the thumbnail needs this row, then swap buffers */
 static int png_row_complete(png_dec_t *d)
 {
     unsigned char *tmp;
@@ -232,15 +224,14 @@ static int png_feed_idat(png_dec_t *d, z_stream *strm,
             continue;
         }
 
-        /* Row still incomplete */
         if (zr == Z_STREAM_END) {
-            return PSPSKY_E_PARSE; /* stream ended with rows missing */
+            return PSPSKY_E_PARSE;
         }
         if (strm->avail_in == 0u) {
-            return PSPSKY_OK;      /* wait for the next IDAT chunk */
+            return PSPSKY_OK;  /* wait for the next IDAT chunk */
         }
         if (d->filled == before) {
-            return PSPSKY_E_PARSE; /* input left but no progress; avoids a hang */
+            return PSPSKY_E_PARSE;  /* reject a stalled stream */
         }
     }
     return PSPSKY_OK;
@@ -276,7 +267,6 @@ int pspsky_png_thumb_decode(const unsigned char *png, size_t png_len,
     memset(&dec, 0, sizeof dec);
     dec.out = out_rgb;
 
-    /* --- Header --- */
     if (pspsky_png_dimensions(png, png_len, &dec.w, &dec.h) != PSPSKY_OK) {
         return PSPSKY_E_PARSE;
     }
@@ -291,9 +281,9 @@ int pspsky_png_thumb_decode(const unsigned char *png, size_t png_len,
     interlace     = (int)png[28];
 
     if (compression != 0 || filter_method != 0 || interlace != 0) {
-        return PSPSKY_E_PARSE; /* also rejects Adam7 interlace */
+        return PSPSKY_E_PARSE;
     }
-    /* Allowed: depth 8 x {0,2,3,4,6}, depth 16 x {0,2,4,6} */
+
     if (dec.depth == 8) {
         if (dec.color != 0 && dec.color != 2 && dec.color != 3 &&
             dec.color != 4 && dec.color != 6) {
@@ -305,10 +295,9 @@ int pspsky_png_thumb_decode(const unsigned char *png, size_t png_len,
             return PSPSKY_E_PARSE;
         }
     } else {
-        return PSPSKY_E_PARSE; /* depths 1/2/4 and anything else */
+        return PSPSKY_E_PARSE;
     }
 
-    /* --- Sizes --- */
     if (dec.w > PSPSKY_PNG_THUMB_MAX_SRC_W) {
         return PSPSKY_E_NOMEM;
     }
@@ -325,7 +314,6 @@ int pspsky_png_thumb_decode(const unsigned char *png, size_t png_len,
         return PSPSKY_E_NOMEM;
     }
 
-    /* --- Row buffers --- */
     channels = png_channels_of(dec.color);
     dec.bpp = (size_t)channels * (size_t)(dec.depth / 8);
     dec.row_bytes = 1u + (size_t)dec.w * dec.bpp;
@@ -340,7 +328,6 @@ int pspsky_png_thumb_decode(const unsigned char *png, size_t png_len,
     /* The row before row 0 is all zeroes, per the PNG specification */
     memset(dec.prev, 0, dec.row_bytes);
 
-    /* --- zlib --- */
     memset(&strm, 0, sizeof strm);
     if (inflateInit(&strm) != Z_OK) {
         free(dec.prev);
@@ -348,7 +335,6 @@ int pspsky_png_thumb_decode(const unsigned char *png, size_t png_len,
         return PSPSKY_E_NOMEM;
     }
 
-    /* --- Chunk scan --- */
     rc = PSPSKY_OK;
     ofs = 8u;
     while (dec.y < dec.h && ofs < png_len) {
@@ -382,7 +368,7 @@ int pspsky_png_thumb_decode(const unsigned char *png, size_t png_len,
             }
         } else if (memcmp(ctype, "IDAT", 4u) == 0) {
             if (dec.color == 3 && !dec.have_plte) {
-                rc = PSPSKY_E_PARSE; /* no PLTE before the first IDAT */
+                rc = PSPSKY_E_PARSE;
                 break;
             }
             rc = png_feed_idat(&dec, &strm, cdata, (size_t)clen);
@@ -390,14 +376,13 @@ int pspsky_png_thumb_decode(const unsigned char *png, size_t png_len,
                 break;
             }
         } else if (memcmp(ctype, "IEND", 4u) == 0) {
-            break; /* missing rows are caught by the check below */
+            break;
         }
-        /* IHDR, tRNS and everything else are skipped */
 
         ofs += 12u + (size_t)clen;
     }
     if (rc == PSPSKY_OK && dec.y < dec.h) {
-        rc = PSPSKY_E_PARSE; /* ran out of chunks with rows still missing */
+        rc = PSPSKY_E_PARSE;
     }
 
     inflateEnd(&strm);

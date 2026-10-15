@@ -1,4 +1,3 @@
-/* UTC time conversion and relative-time formatting. Portable C99, libc only. */
 #ifndef PSPSKY_TIMEUTIL_H
 #define PSPSKY_TIMEUTIL_H
 
@@ -14,15 +13,19 @@ long long pspsky_iso8601_parse(const char *s);
 /* epoch seconds -> "YYYY-MM-DDTHH:MM:SS.000Z"; bufsz >= 25 */
 int pspsky_iso8601_format(long long unix_utc, char *buf, size_t bufsz);
 
-/* Buckets on diff = now - post: <60s, <60m, <24h, <7d, else "YYYY/MM/DD" (UTC).
-   post_unix < 0 gives "----". Wording comes from PSPSKY_STR_TIME_*; bufsz >= 16. */
+/*
+ * Relative time uses seconds, minutes, hours, days, then 30-day months.
+ * From 360 days, use the UTC date: "YYYY/M/D" (ja) or "M/D/YYYY" (en).
+ * A future time or age under 5 seconds gives "now"; post_unix < 0 gives "----".
+ * bufsz must be at least 16.
+ */
 int pspsky_format_relative_ja(long long post_unix, long long now_unix,
                               char *buf, size_t bufsz);
 
 int pspsky_format_relative_en(long long post_unix, long long now_unix,
                               char *buf, size_t bufsz);
 
-/* Dispatches to _ja / _en by the current UI language; the UI calls this one */
+/* Use the current UI language. */
 int pspsky_format_relative(long long post_unix, long long now_unix,
                            char *buf, size_t bufsz);
 

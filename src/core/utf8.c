@@ -1,5 +1,4 @@
-/* UTF-8 / UCS-2 conversion helpers. All internal strings are UTF-8; UCS-2 is
- * used only at the OSK boundary. */
+/* Internal strings are UTF-8; UCS-2 is used only at the OSK boundary. */
 
 #include <string.h>
 
@@ -21,12 +20,10 @@ unsigned int pspsky_utf8_next(const char **p)
     s = (const unsigned char *)(*p);
     c0 = (unsigned int)s[0];
 
-    /* At NUL: return 0 without advancing *p */
     if (c0 == 0u) {
         return 0;
     }
 
-    /* ASCII */
     if (c0 < 0x80u) {
         *p += 1;
         return c0;
@@ -42,8 +39,7 @@ unsigned int pspsky_utf8_next(const char **p)
         len = 4;
         cp = c0 & 0x07u;
     } else {
-        /* Stray continuation byte (0x80-0xBF), overlong lead (0xC0/0xC1),
-           or out of range (0xF5-0xFF) */
+        /* Reject stray continuation bytes, overlong leads, and values above 0xF4. */
         *p += 1;
         return UTF8_REPLACEMENT;
     }
@@ -92,7 +88,7 @@ int pspsky_utf8_to_ucs2(const char *utf8, unsigned short *out, int out_cap)
             break;
         }
         if (cp > 0xFFFFu) {
-            cp = UTF8_REPLACEMENT;   /* non-BMP is not representable in UCS-2 */
+            cp = UTF8_REPLACEMENT;  /* non-BMP is not representable in UCS-2 */
         }
         out[n++] = (unsigned short)cp;
     }
@@ -122,7 +118,6 @@ int pspsky_ucs2_to_utf8(const unsigned short *in, char *out, size_t out_cap)
             need = 3;
         }
 
-        /* Stop while still leaving room for the NUL terminator */
         if (n + need > out_cap - 1) {
             break;
         }
@@ -157,7 +152,6 @@ size_t pspsky_utf8_truncate(char *s, size_t max_bytes)
         return len;
     }
 
-    /* Walk code point boundaries and cut at the last one within max_bytes */
     p = s;
     for (;;) {
         const char *q = p;
