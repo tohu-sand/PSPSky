@@ -103,6 +103,12 @@ static const char *const k_ja[PSPSKY_STR_COUNT] = {
         "投稿への返信",
     [PSPSKY_STR_UI_REPLIED_TO_BLOCKED] =
         "ブロックされた投稿への返信",
+    [PSPSKY_STR_UI_QUOTE_NOT_FOUND] =
+        "削除された投稿",
+    [PSPSKY_STR_UI_QUOTE_BLOCKED] =
+        "ブロックされた投稿",
+    [PSPSKY_STR_UI_QUOTE_DETACHED] =
+        "投稿者が引用を解除しました",
     [PSPSKY_STR_UI_EMBED_MARK] =
         "画像",
     [PSPSKY_STR_UI_IMG_MARK_N] =
@@ -297,6 +303,12 @@ static const char *const k_en[PSPSKY_STR_COUNT] = {
         "Replied to a post",
     [PSPSKY_STR_UI_REPLIED_TO_BLOCKED] =
         "Replied to a blocked post",
+    [PSPSKY_STR_UI_QUOTE_NOT_FOUND] =
+        "Deleted post",
+    [PSPSKY_STR_UI_QUOTE_BLOCKED] =
+        "Blocked post",
+    [PSPSKY_STR_UI_QUOTE_DETACHED] =
+        "Removed by author",
     [PSPSKY_STR_UI_EMBED_MARK] =
         "Image",
     [PSPSKY_STR_UI_IMG_MARK_N] =

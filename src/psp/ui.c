@@ -52,6 +52,14 @@
 #define UI_TL_IMG_GAP   5
 #define UI_IMG_RADIUS   6
 #define UI_CHIP_H       20  /* fallback image marker */
+#define UI_QUOTE_GAP    6  /* above the quote card */
+#define UI_QUOTE_PAD_X  8
+#define UI_QUOTE_PAD_T  4
+#define UI_QUOTE_PAD_B  6
+#define UI_QUOTE_RADIUS 8
+#define UI_QUOTE_NOTE_H 26  /* unavailable quote */
+#define UI_QUOTE_X      (UI_CONTENT_X + UI_QUOTE_PAD_X)
+#define UI_QUOTE_W      (UI_CONTENT_W - 2 * UI_QUOTE_PAD_X)
 #define UI_END_H        36  /* load-more row */
 
 #define UI_SCROLL_STEP  8
@@ -123,6 +131,15 @@
 #error "timeline image bounds exceed the content column"
 #endif
 
+/* Quoted thumbnails share the post decode buffer in main. */
+#if PSPSKY_UI_QT_IMG_MAX_W > UI_QUOTE_W || \
+    2 * PSPSKY_UI_QT_GRID_COL_W + PSPSKY_UI_TL_GRID_GAP > UI_QUOTE_W || \
+    PSPSKY_UI_QT_GRID_ROW_H > PSPSKY_UI_QT_IMG_MAX_H || \
+    PSPSKY_UI_QT_IMG_MAX_W > PSPSKY_UI_TL_IMG_MAX_W || \
+    PSPSKY_UI_QT_IMG_MAX_H > PSPSKY_UI_TL_IMG_MAX_H
+#error "quoted image bounds exceed the quote card or the post bounds"
+#endif
+
 /* Inverted corner coverage, one quadrant per corner. */
 #define UI_CORNER_TEX     16
 #if 2 * UI_IMG_RADIUS > UI_CORNER_TEX
@@ -182,12 +199,15 @@ static int  s_wrap_len[UI_WRAP_MAX_LINES];
 static char s_line_buf[PSPSKY_MAX_TEXT + 1];
 
 /*
- * Cache wrapped byte offsets and lengths (32 KiB) to avoid measuring every
- * code point each frame. Valid for s_layout_count posts while s_layout_valid
- * is set. PSPSKY_MAX_TEXT must fit in a short.
+ * Cache wrapped byte offsets and lengths (32 KiB each for post and quote
+ * text) to avoid measuring every code point each frame. Valid for
+ * s_layout_count posts while s_layout_valid is set. PSPSKY_MAX_TEXT must fit
+ * in a short.
  */
 static short s_pw_start[UI_MAX_LAYOUT_POSTS][UI_WRAP_MAX_LINES];
 static short s_pw_len[UI_MAX_LAYOUT_POSTS][UI_WRAP_MAX_LINES];
+static short s_qw_start[UI_MAX_LAYOUT_POSTS][UI_WRAP_MAX_LINES];
+static short s_qw_len[UI_MAX_LAYOUT_POSTS][UI_WRAP_MAX_LINES];
 
 /* Store truncation offsets to limit per-post memory use. */
 typedef struct {
@@ -198,13 +218,19 @@ typedef struct {
 typedef struct {
     ui_fit_cache_t name;
     ui_fit_cache_t handle;
-    ui_fit_cache_t repost;
-    ui_fit_cache_t reply;
-    short         lines;
-    short         has_handle;
-    float         handle_x;
-    float         time_x;  /* start of the time separator */
-    float         time_room;  /* width reserved for relative time */
+    short          has_handle;
+    float          handle_x;
+    float          time_x;  /* start of the time separator */
+    float          time_room;  /* width reserved for relative time */
+} ui_meta_cache_t;
+
+typedef struct {
+    ui_meta_cache_t meta;
+    ui_meta_cache_t quote_meta;
+    ui_fit_cache_t  repost;
+    ui_fit_cache_t  reply;
+    short           lines;
+    short           quote_lines;
 } ui_post_cache_t;
 
 static ui_post_cache_t s_post_cache[UI_MAX_LAYOUT_POSTS];
@@ -797,13 +823,37 @@ static void ui_draw_footer(int y, const ui_button_t *main_btn,
     }
 }
 
-static int ui_image_count(const pspsky_post_t *post)
+/* Layout, drawing and decoding of one attachment grid share these bounds. */
+typedef struct {
+    int max_w;  /* one image */
+    int max_h;  /* one row of one or two images */
+    int col_w;  /* two or more images */
+    int row_h;  /* two rows of three or four images */
+} ui_img_box_t;
+
+static const ui_img_box_t k_ui_post_box = {
+    PSPSKY_UI_TL_IMG_MAX_W, PSPSKY_UI_TL_IMG_MAX_H,
+    PSPSKY_UI_TL_GRID_COL_W, PSPSKY_UI_TL_GRID_ROW_H
+};
+
+static const ui_img_box_t k_ui_quote_box = {
+    PSPSKY_UI_QT_IMG_MAX_W, PSPSKY_UI_QT_IMG_MAX_H,
+    PSPSKY_UI_QT_GRID_COL_W, PSPSKY_UI_QT_GRID_ROW_H
+};
+
+static void ui_img_box_max(const ui_img_box_t *b, int count,
+                           int *max_w, int *max_h)
 {
-    if (post->img_count < 0) {
+    *max_w = (count > 1) ? b->col_w : b->max_w;
+    *max_h = (count > 2) ? b->row_h : b->max_h;
+}
+
+static int ui_image_count(int img_count)
+{
+    if (img_count < 0) {
         return 0;
     }
-    return (post->img_count > PSPSKY_MAX_IMAGES) ?
-           PSPSKY_MAX_IMAGES : post->img_count;
+    return (img_count > PSPSKY_MAX_IMAGES) ? PSPSKY_MAX_IMAGES : img_count;
 }
 
 /* GE buffer widths for 16-bit texels must be multiples of eight. */
@@ -824,7 +874,8 @@ static int ui_tex_pow2(int v)
 }
 
 /* Layout and drawing must use the same image validity checks. */
-static const pspsky_ui_tl_image_t *ui_tl_image(const pspsky_ui_tl_image_t *images,
+static const pspsky_ui_tl_image_t *ui_tl_image(const ui_img_box_t *b,
+                                              const pspsky_ui_tl_image_t *images,
                                               int image, int count)
 {
     const pspsky_ui_tl_image_t *img;
@@ -833,7 +884,7 @@ static const pspsky_ui_tl_image_t *ui_tl_image(const pspsky_ui_tl_image_t *image
     if (images == NULL || image < 0 || image >= count) {
         return NULL;
     }
-    pspsky_ui_tl_image_max(count, &max_w, &max_h);
+    ui_img_box_max(b, count, &max_w, &max_h);
     img = &images[image];
     if (img->tex == NULL ||
         img->w < 1 || img->w > max_w ||
@@ -847,20 +898,40 @@ static const pspsky_ui_tl_image_t *ui_tl_image(const pspsky_ui_tl_image_t *image
  * Keep original image indices. NULL means all images are unavailable and the
  * count marker should be shown.
  */
-static const pspsky_ui_tl_image_t *ui_tl_images(const pspsky_ui_timeline_view_t *view,
-                                               int idx)
+static const pspsky_ui_tl_image_t *ui_tl_images(const ui_img_box_t *b,
+                                               const pspsky_ui_tl_image_t *images,
+                                               int count)
 {
-    int count = ui_image_count(&view->posts[idx]);
     int i;
 
-    if (view->images != NULL) {
+    if (images != NULL) {
         for (i = 0; i < count; i++) {
-            if (ui_tl_image(view->images[idx], i, count) != NULL) {
-                return view->images[idx];
+            if (ui_tl_image(b, images, i, count) != NULL) {
+                return images;
             }
         }
     }
     return NULL;
+}
+
+static const pspsky_ui_tl_image_t *ui_post_images(const pspsky_ui_timeline_view_t *view,
+                                                 int idx)
+{
+    return ui_tl_images(&k_ui_post_box,
+                        (view->images != NULL) ? view->images[idx] : NULL,
+                        ui_image_count(view->posts[idx].img_count));
+}
+
+static const pspsky_ui_tl_image_t *ui_quote_images(const pspsky_ui_timeline_view_t *view,
+                                                  int idx)
+{
+    const pspsky_post_t *post = &view->posts[idx];
+
+    if (post->quote != PSPSKY_QUOTE_POST || view->quote_images == NULL) {
+        return NULL;
+    }
+    return ui_tl_images(&k_ui_quote_box, view->quote_images[idx],
+                        ui_image_count(post->quoted.img_count));
 }
 
 static const pspsky_ui_avatar_t *ui_avatar(const pspsky_ui_timeline_view_t *view,
@@ -870,55 +941,55 @@ static const pspsky_ui_avatar_t *ui_avatar(const pspsky_ui_timeline_view_t *view
 }
 
 /* A row with no available image falls back to the decode bound. */
-static int ui_tl_row_h(const pspsky_ui_tl_image_t *images, int count, int row)
+static int ui_tl_row_h(const ui_img_box_t *b, const pspsky_ui_tl_image_t *images,
+                       int count, int row)
 {
     int h = 0;
     int max_w, max_h, i;
 
     for (i = 2 * row; i < count && i < 2 * row + 2; i++) {
-        const pspsky_ui_tl_image_t *img = ui_tl_image(images, i, count);
+        const pspsky_ui_tl_image_t *img = ui_tl_image(b, images, i, count);
 
         if (img != NULL && img->h > h) {
             h = img->h;
         }
     }
     if (h == 0) {
-        pspsky_ui_tl_image_max(count, &max_w, &max_h);
+        ui_img_box_max(b, count, &max_w, &max_h);
         h = max_h;
     }
     return h;
 }
 
-/* Must match the attachment layout in ui_draw_post(). */
-static int ui_post_extra_h(const pspsky_post_t *post,
-                           const pspsky_ui_tl_image_t *images)
+/* Includes the gap above the attachments. Must match ui_draw_images(). */
+static int ui_images_h(const ui_img_box_t *b, const pspsky_ui_tl_image_t *images,
+                       int count)
 {
     if (images != NULL) {
-        int count = ui_image_count(post);
-        int h     = UI_TL_IMG_GAP - PSPSKY_UI_TL_GRID_GAP;
+        int h = UI_TL_IMG_GAP - PSPSKY_UI_TL_GRID_GAP;
         int row;
 
         if (count == 1) {
             return UI_TL_IMG_GAP + images[0].h;
         }
         for (row = 0; 2 * row < count; row++) {
-            h += PSPSKY_UI_TL_GRID_GAP + ui_tl_row_h(images, count, row);
+            h += PSPSKY_UI_TL_GRID_GAP + ui_tl_row_h(b, images, count, row);
         }
         return h;
     }
-    if (post->img_count >= 1) {
+    if (count >= 1) {
         return UI_TL_IMG_GAP + UI_CHIP_H;
     }
-    /* Link cards and quoted records get no marker of their own. */
+    /* Link cards get no marker of their own. */
     return 0;
 }
 
-static const char *ui_img_mark(const pspsky_post_t *post, char *buf, size_t cap)
+static const char *ui_img_mark(int count, char *buf, size_t cap)
 {
-    if (post->img_count < 2) {
+    if (count < 2) {
         return UI_EMBED_MARK;
     }
-    snprintf(buf, cap, UI_IMG_MARK_N_FMT, post->img_count);
+    snprintf(buf, cap, UI_IMG_MARK_N_FMT, count);
     return buf;
 }
 
@@ -1022,10 +1093,10 @@ static void ui_draw_avatar(const pspsky_ui_avatar_t *av, int x, int y)
                 UI_AVATAR_PX, UI_AVATAR_PX, UI_AVATAR_PX, UI_AVATAR_PX, x, y);
 }
 
-static void ui_draw_img_chip(const pspsky_post_t *post, int x, int y)
+static void ui_draw_img_chip(int count, int x, int y)
 {
     char        buf[32];
-    const char *label = ui_img_mark(post, buf, sizeof buf);
+    const char *label = ui_img_mark(count, buf, sizeof buf);
     int         w     = 8 + 12 + 5 + (int)ui_measure(UI_SIZE_SMALL, label) + 9;
 
     ui_fill_rrect(x, y, w, UI_CHIP_H, 6, UI_COL_BORDER);
@@ -1047,10 +1118,10 @@ static void ui_draw_img_placeholder(int x, int y, int w, int h)
  * Letterboxes img on a card. An image reaching the card's corner squares is
  * masked again with the background outside the card's rounded corners.
  */
-static void ui_draw_tl_cell(const pspsky_ui_tl_image_t *img, int x, int y, int h)
+static void ui_draw_tl_cell(const pspsky_ui_tl_image_t *img, int x, int y,
+                            int w, int h)
 {
-    const int w = PSPSKY_UI_TL_GRID_COL_W;
-    int       dx, dy;
+    int dx, dy;
 
     if (img == NULL) {
         ui_draw_img_placeholder(x, y, w, h);
@@ -1099,15 +1170,49 @@ static const char *ui_reply_text(const pspsky_post_t *post, char *buf, size_t ca
     }
 }
 
+static const char *ui_quote_note(const pspsky_post_t *post)
+{
+    switch (post->quote) {
+    case PSPSKY_QUOTE_NOT_FOUND:
+        return pspsky_tr(PSPSKY_STR_UI_QUOTE_NOT_FOUND);
+    case PSPSKY_QUOTE_BLOCKED:
+        return pspsky_tr(PSPSKY_STR_UI_QUOTE_BLOCKED);
+    case PSPSKY_QUOTE_DETACHED:
+        return pspsky_tr(PSPSKY_STR_UI_QUOTE_DETACHED);
+    default:
+        return NULL;
+    }
+}
+
+/* Excludes UI_QUOTE_GAP; 0 = no card. Must match ui_draw_quote(). */
+static int ui_quote_card_h(const pspsky_post_t *post, const ui_post_cache_t *c,
+                           const pspsky_ui_tl_image_t *quote_images)
+{
+    if (post->quote != PSPSKY_QUOTE_POST) {
+        return (ui_quote_note(post) != NULL) ? UI_QUOTE_NOTE_H : 0;
+    }
+    return UI_QUOTE_PAD_T + UI_META_H + c->quote_lines * UI_LINE_H +
+           ui_images_h(&k_ui_quote_box, quote_images,
+                       ui_image_count(post->quoted.img_count)) +
+           UI_QUOTE_PAD_B;
+}
+
 /*
  * Must match the vertical advances and context-line conditions in
  * ui_draw_post().
  */
 static int ui_post_height(const pspsky_post_t *post, const ui_post_cache_t *c,
-                          const pspsky_ui_tl_image_t *images)
+                          const pspsky_ui_tl_image_t *images,
+                          const pspsky_ui_tl_image_t *quote_images)
 {
     char buf[UI_CTX_BUF];
-    int  col = UI_META_H + c->lines * UI_LINE_H + ui_post_extra_h(post, images);
+    int  col = UI_META_H + c->lines * UI_LINE_H +
+               ui_images_h(&k_ui_post_box, images, ui_image_count(post->img_count));
+    int  quote_h = ui_quote_card_h(post, c, quote_images);
+
+    if (quote_h > 0) {
+        col += UI_QUOTE_GAP + quote_h;
+    }
 
     if (ui_reply_text(post, buf, sizeof buf) != NULL) {
         col += UI_CTX_H;
@@ -1128,10 +1233,10 @@ static float ui_time_w(const char *t)
     return (float)(2 * UI_DOT_GAP + UI_DOT_PX) + ui_measure(UI_SIZE_NAME, t);
 }
 
-static void ui_post_time(const pspsky_post_t *post, long long now_unix,
-                         char *buf, size_t cap)
+static void ui_rel_time(long long created_at_unix, long long now_unix,
+                        char *buf, size_t cap)
 {
-    if (pspsky_format_relative(post->created_at_unix, now_unix,
+    if (pspsky_format_relative(created_at_unix, now_unix,
                                buf, cap) != PSPSKY_OK) {
         buf[0] = '\0';
     }
@@ -1141,19 +1246,19 @@ static void ui_post_time(const pspsky_post_t *post, long long now_unix,
  * Reserve room for the time; omit the handle when too little fits or it is
  * already used as the display name.
  */
-static void ui_fit_meta(ui_post_cache_t *c, const pspsky_post_t *post, float room)
+static void ui_fit_meta(ui_meta_cache_t *c, const char *display_name,
+                        const char *handle, int x, int width, float room)
 {
     char        namebuf[UI_NAME_BUF];
     char        hsrc[UI_HSRC_BUF];
     char        hbuf[UI_HANDLE_BUF];
-    const char *name  = (post->display_name[0] != '\0') ? post->display_name
-                                                         : post->handle;
-    float       avail = (float)UI_CONTENT_W - room;
-    float       name_max = (float)UI_CONTENT_W * 0.7f;
+    const char *name  = (display_name[0] != '\0') ? display_name : handle;
+    float       avail = (float)width - room;
+    float       name_max = (float)width * 0.7f;
     float       w;
 
     hsrc[0] = '\0';
-    if (name_max > avail || post->display_name[0] == '\0') {
+    if (name_max > avail || display_name[0] == '\0') {
         name_max = avail;
     }
     ui_fit_head_calc(name, UI_SIZE_NAME, name_max - 1.0f, UI_NAME_BUF, &c->name);
@@ -1164,8 +1269,8 @@ static void ui_fit_meta(ui_post_cache_t *c, const pspsky_post_t *post, float roo
     c->has_handle = 0;
     c->handle.cut = 0;
     c->handle.ell = 0;
-    if (post->display_name[0] != '\0' && post->handle[0] != '\0') {
-        snprintf(hsrc, sizeof hsrc, " @%s", post->handle);
+    if (display_name[0] != '\0' && handle[0] != '\0') {
+        snprintf(hsrc, sizeof hsrc, " @%s", handle);
         ui_fit_head_calc(hsrc, UI_SIZE_NAME, avail - w, UI_HANDLE_BUF, &c->handle);
         if (c->handle.cut >= 4) {  /* " @" and at least two handle bytes */
             c->has_handle = 1;
@@ -1177,7 +1282,7 @@ static void ui_fit_meta(ui_post_cache_t *c, const pspsky_post_t *post, float roo
                                                   UI_NAME_BUF));
         }
     }
-    c->handle_x = (float)UI_CONTENT_X + w;
+    c->handle_x = (float)x + w;
     c->time_x   = c->handle_x;
     if (c->has_handle) {
         c->time_x += ui_measure(UI_SIZE_NAME,
@@ -1189,28 +1294,49 @@ static void ui_fit_meta(ui_post_cache_t *c, const pspsky_post_t *post, float roo
     }
 }
 
+static short ui_wrap_cache(const char *text, int width, short *start, short *len)
+{
+    int lines = ui_wrap(text, UI_SIZE_BODY, (float)width);
+    int i;
+
+    if (lines > UI_WRAP_MAX_LINES) {
+        lines = UI_WRAP_MAX_LINES;
+    }
+    for (i = 0; i < lines; i++) {
+        start[i] = (short)s_wrap_start[i];
+        len[i]   = (short)s_wrap_len[i];
+    }
+    return (short)lines;
+}
+
 static int ui_layout_post(int idx, const pspsky_post_t *post,
-                          const pspsky_ui_tl_image_t *images, long long now_unix)
+                          const pspsky_ui_tl_image_t *images,
+                          const pspsky_ui_tl_image_t *quote_images,
+                          long long now_unix)
 {
     ui_post_cache_t *c = &s_post_cache[idx];
     char             ctxbuf[UI_CTX_BUF];
     char             tbuf[24];
     const char      *ctx;
-    int              lines, i;
 
-    lines = ui_wrap(post->text, UI_SIZE_BODY, (float)UI_CONTENT_W);
-    if (lines > UI_WRAP_MAX_LINES) {
-        lines = UI_WRAP_MAX_LINES;
-    }
-    for (i = 0; i < lines; i++) {
-        s_pw_start[idx][i] = (short)s_wrap_start[i];
-        s_pw_len[idx][i]   = (short)s_wrap_len[i];
-    }
-    c->lines = (short)lines;
+    c->lines = ui_wrap_cache(post->text, UI_CONTENT_W,
+                             s_pw_start[idx], s_pw_len[idx]);
 
     /* Reserve one extra time digit before the names need refitting. */
-    ui_post_time(post, now_unix, tbuf, sizeof tbuf);
-    ui_fit_meta(c, post, ui_time_w(tbuf) + s_digit_w);
+    ui_rel_time(post->created_at_unix, now_unix, tbuf, sizeof tbuf);
+    ui_fit_meta(&c->meta, post->display_name, post->handle,
+                UI_CONTENT_X, UI_CONTENT_W, ui_time_w(tbuf) + s_digit_w);
+
+    c->quote_lines = 0;
+    if (post->quote == PSPSKY_QUOTE_POST) {
+        const pspsky_quote_t *q = &post->quoted;
+
+        c->quote_lines = ui_wrap_cache(q->text, UI_QUOTE_W,
+                                       s_qw_start[idx], s_qw_len[idx]);
+        ui_rel_time(q->created_at_unix, now_unix, tbuf, sizeof tbuf);
+        ui_fit_meta(&c->quote_meta, q->display_name, q->handle,
+                    UI_QUOTE_X, UI_QUOTE_W, ui_time_w(tbuf) + s_digit_w);
+    }
 
     c->repost.cut = 0;
     c->repost.ell = 0;
@@ -1228,7 +1354,7 @@ static int ui_layout_post(int idx, const pspsky_post_t *post,
                          &c->reply);
     }
 
-    return ui_post_height(post, c, images);
+    return ui_post_height(post, c, images, quote_images);
 }
 
 static int ui_clamp_count(int count)
@@ -1250,8 +1376,8 @@ static void ui_rebuild_layout(const pspsky_ui_timeline_view_t *view)
 
     for (i = 0; i < n; i++) {
         s_post_top[i] = y;
-        y += ui_layout_post(i, &view->posts[i], ui_tl_images(view, i),
-                            view->now_unix);
+        y += ui_layout_post(i, &view->posts[i], ui_post_images(view, i),
+                            ui_quote_images(view, i), view->now_unix);
     }
     s_post_top[n]  = y;
     s_layout_more  = (view->has_more != 0);
@@ -1337,21 +1463,148 @@ static int ui_visible(int y, int h)
     return (y + h > s_vis_top && y < s_vis_bottom);
 }
 
-/* Requires a valid layout cache and idx < s_layout_count. */
-static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
-                         long long now_unix, const pspsky_ui_tl_image_t *images,
-                         const pspsky_ui_avatar_t *av)
+/* y is the top of the gap above the attachments; see ui_images_h(). */
+static void ui_draw_images(const ui_img_box_t *b,
+                           const pspsky_ui_tl_image_t *images, int count,
+                           int x, int y)
 {
-    ui_post_cache_t *c = &s_post_cache[idx];
+    int iy = y + UI_TL_IMG_GAP;
+    int r, i;
+
+    if (images == NULL) {
+        if (count >= 1 && ui_visible(iy, UI_CHIP_H)) {
+            ui_draw_img_chip(count, x, iy);
+        }
+        return;
+    }
+    if (count == 1) {
+        if (ui_visible(iy, images[0].h)) {
+            ui_draw_tl_image(&images[0], x, iy, UI_COL_BG);
+        }
+        return;
+    }
+    for (r = 0; 2 * r < count; r++) {
+        int rh = ui_tl_row_h(b, images, count, r);
+
+        for (i = 2 * r; i < count && i < 2 * r + 2 && ui_visible(iy, rh); i++) {
+            ui_draw_tl_cell(ui_tl_image(b, images, i, count),
+                            x + (i % 2) * (b->col_w + PSPSKY_UI_TL_GRID_GAP),
+                            iy, b->col_w, rh);
+        }
+        iy += rh + PSPSKY_UI_TL_GRID_GAP;
+    }
+}
+
+/* row is the top of the meta line; refits names when the time grows. */
+static void ui_draw_meta(ui_meta_cache_t *c, const char *display_name,
+                         const char *handle, long long created_at_unix,
+                         long long now_unix, int x, int width, int row)
+{
     char        hsrc[UI_HSRC_BUF];
     char        namebuf[UI_NAME_BUF];
     char        handlebuf[UI_HANDLE_BUF];
+    char        tbuf[24];
+    const char *name = (display_name[0] != '\0') ? display_name : handle;
+    float       tw;
+
+    ui_rel_time(created_at_unix, now_unix, tbuf, sizeof tbuf);
+    tw = ui_time_w(tbuf);
+    if (tw > c->time_room) {
+        ui_fit_meta(c, display_name, handle, x, width, tw + s_digit_w);
+    }
+    ui_text_bold(UI_SIZE_NAME, UI_COL_TEXT, (float)x,
+                 (float)(row + UI_META_BASE),
+                 ui_fit_head_apply(name, &c->name, namebuf, UI_NAME_BUF));
+    if (c->has_handle) {
+        snprintf(hsrc, sizeof hsrc, " @%s", handle);
+        ui_text(UI_SIZE_NAME, UI_COL_MED, c->handle_x,
+                (float)(row + UI_META_BASE),
+                ui_fit_head_apply(hsrc, &c->handle, handlebuf, UI_HANDLE_BUF));
+    }
+    if (tbuf[0] != '\0') {
+        /* jpn0.pgf lacks U+00B7; draw the separator as an icon. */
+        int dx = (int)(c->time_x + 0.5f) + UI_DOT_GAP;
+
+        ui_icon_scaled(UI_ICON_CIRCLE16, (float)dx,
+                       (float)(row + UI_META_BASE - 5),
+                       (float)UI_DOT_PX, (float)UI_DOT_PX, UI_COL_MED);
+        ui_text(UI_SIZE_NAME, UI_COL_MED,
+                (float)(dx + UI_DOT_PX + UI_DOT_GAP),
+                (float)(row + UI_META_BASE), tbuf);
+    }
+}
+
+/*
+ * Quoted text is drawn plain; its link facets are not stored. A card taller
+ * than the screen is clipped so GE coordinates stay in range; its cut corners
+ * fall outside the screen.
+ */
+static void ui_draw_quote(const pspsky_post_t *post, int idx, int y,
+                          long long now_unix,
+                          const pspsky_ui_tl_image_t *quote_images)
+{
+    ui_post_cache_t      *c    = &s_post_cache[idx];
+    const pspsky_quote_t *q    = &post->quoted;
+    const char           *note = ui_quote_note(post);
+    int                   h    = ui_quote_card_h(post, c, quote_images);
+    int                   top, bottom, i;
+
+    if (h <= 0 || !ui_visible(y, h)) {
+        return;
+    }
+    top    = y;
+    bottom = y + h;
+    if (top < -UI_QUOTE_RADIUS) {
+        top = -UI_QUOTE_RADIUS;
+    }
+    if (bottom > UI_SCR_H + UI_QUOTE_RADIUS) {
+        bottom = UI_SCR_H + UI_QUOTE_RADIUS;
+    }
+    ui_fill_rrect(UI_CONTENT_X, top, UI_CONTENT_W, bottom - top,
+                  UI_QUOTE_RADIUS, UI_COL_BORDER);
+    ui_fill_rrect(UI_CONTENT_X + 1, top + 1, UI_CONTENT_W - 2, bottom - top - 2,
+                  UI_QUOTE_RADIUS - 1, UI_COL_BG);
+
+    if (note != NULL) {
+        ui_text(UI_SIZE_SMALL, UI_COL_MED, (float)UI_QUOTE_X,
+                (float)(y + UI_QUOTE_NOTE_H / 2 + 4), note);
+        return;
+    }
+
+    y += UI_QUOTE_PAD_T;
+    if (ui_visible(y, UI_META_H)) {
+        ui_draw_meta(&c->quote_meta, q->display_name, q->handle,
+                     q->created_at_unix, now_unix, UI_QUOTE_X, UI_QUOTE_W, y);
+    }
+    y += UI_META_H;
+
+    for (i = 0; i < c->quote_lines; i++) {
+        int ly = y + i * UI_LINE_H;
+
+        if (!ui_visible(ly, UI_LINE_H)) {
+            continue;
+        }
+        ui_text(UI_SIZE_BODY, UI_COL_TEXT, (float)UI_QUOTE_X,
+                (float)(ly + UI_BASELINE),
+                ui_copy_line(q->text, s_qw_start[idx][i], s_qw_len[idx][i]));
+    }
+    y += c->quote_lines * UI_LINE_H;
+
+    ui_draw_images(&k_ui_quote_box, quote_images, ui_image_count(q->img_count),
+                   UI_QUOTE_X, y);
+}
+
+/* Requires a valid layout cache and idx < s_layout_count. */
+static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
+                         long long now_unix, const pspsky_ui_tl_image_t *images,
+                         const pspsky_ui_tl_image_t *quote_images,
+                         const pspsky_ui_avatar_t *av)
+{
+    ui_post_cache_t *c = &s_post_cache[idx];
     char        ctxbuf[UI_CTX_BUF];
     char        fitbuf[UI_CTX_BUF];
-    char        tbuf[24];
-    const char *name;
     const char *ctx;
-    int         y, row, i;
+    int         y, row, count, i;
 
     y = top + UI_POST_PAD_T;
 
@@ -1373,34 +1626,9 @@ static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
     }
 
     if (ui_visible(row, UI_META_H)) {
-        float tw;
-
-        ui_post_time(post, now_unix, tbuf, sizeof tbuf);
-        tw = ui_time_w(tbuf);
-        if (tw > c->time_room) {
-            ui_fit_meta(c, post, tw + s_digit_w);
-        }
-        name = (post->display_name[0] != '\0') ? post->display_name : post->handle;
-        ui_text_bold(UI_SIZE_NAME, UI_COL_TEXT, (float)UI_CONTENT_X,
-                     (float)(row + UI_META_BASE),
-                     ui_fit_head_apply(name, &c->name, namebuf, UI_NAME_BUF));
-        if (c->has_handle) {
-            snprintf(hsrc, sizeof hsrc, " @%s", post->handle);
-            ui_text(UI_SIZE_NAME, UI_COL_MED, c->handle_x,
-                    (float)(row + UI_META_BASE),
-                    ui_fit_head_apply(hsrc, &c->handle, handlebuf, UI_HANDLE_BUF));
-        }
-        if (tbuf[0] != '\0') {
-            /* jpn0.pgf lacks U+00B7; draw the separator as an icon. */
-            int dx = (int)(c->time_x + 0.5f) + UI_DOT_GAP;
-
-            ui_icon_scaled(UI_ICON_CIRCLE16, (float)dx,
-                           (float)(row + UI_META_BASE - 5),
-                           (float)UI_DOT_PX, (float)UI_DOT_PX, UI_COL_MED);
-            ui_text(UI_SIZE_NAME, UI_COL_MED,
-                    (float)(dx + UI_DOT_PX + UI_DOT_GAP),
-                    (float)(row + UI_META_BASE), tbuf);
-        }
+        ui_draw_meta(&c->meta, post->display_name, post->handle,
+                     post->created_at_unix, now_unix, UI_CONTENT_X,
+                     UI_CONTENT_W, row);
     }
     y = row + UI_META_H;
 
@@ -1427,37 +1655,12 @@ static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
     }
     y += c->lines * UI_LINE_H;
 
-    /* Same cases as ui_post_extra_h(), which supplies the height. */
-    if (images != NULL) {
-        int count = ui_image_count(post);
-        int iy = y + UI_TL_IMG_GAP;
+    count = ui_image_count(post->img_count);
+    ui_draw_images(&k_ui_post_box, images, count, UI_CONTENT_X, y);
+    y += ui_images_h(&k_ui_post_box, images, count);
 
-        if (count == 1) {
-            if (ui_visible(iy, images[0].h)) {
-                ui_draw_tl_image(&images[0], UI_CONTENT_X, iy, UI_COL_BG);
-            }
-        } else {
-            int r;
-
-            for (r = 0; 2 * r < count; r++) {
-                int rh = ui_tl_row_h(images, count, r);
-
-                for (i = 2 * r; i < count && i < 2 * r + 2 &&
-                                ui_visible(iy, rh); i++) {
-                    ui_draw_tl_cell(ui_tl_image(images, i, count),
-                                    UI_CONTENT_X + (i % 2) *
-                                    (PSPSKY_UI_TL_GRID_COL_W +
-                                     PSPSKY_UI_TL_GRID_GAP),
-                                    iy, rh);
-                }
-                iy += rh + PSPSKY_UI_TL_GRID_GAP;
-            }
-        }
-    } else if (post->img_count >= 1) {
-        if (ui_visible(y + UI_TL_IMG_GAP, UI_CHIP_H)) {
-            ui_draw_img_chip(post, UI_CONTENT_X, y + UI_TL_IMG_GAP);
-        }
-    }
+    /* Media comes before the quote, as in the official client. */
+    ui_draw_quote(post, idx, y + UI_QUOTE_GAP, now_unix, quote_images);
 
     ui_draw_rect(0, top + (s_post_top[idx + 1] - s_post_top[idx]) - 1,
                  UI_SCR_W, 1, UI_COL_BORDER);
@@ -2567,8 +2770,12 @@ int pspsky_ui_preview_image(const pspsky_ui_preview_t *pv)
 
 void pspsky_ui_tl_image_max(int count, int *max_w, int *max_h)
 {
-    *max_w = (count > 1) ? PSPSKY_UI_TL_GRID_COL_W : PSPSKY_UI_TL_IMG_MAX_W;
-    *max_h = (count > 2) ? PSPSKY_UI_TL_GRID_ROW_H : PSPSKY_UI_TL_IMG_MAX_H;
+    ui_img_box_max(&k_ui_post_box, count, max_w, max_h);
+}
+
+void pspsky_ui_quote_image_max(int count, int *max_w, int *max_h)
+{
+    ui_img_box_max(&k_ui_quote_box, count, max_w, max_h);
 }
 
 size_t pspsky_ui_tl_image_bytes(int w, int h)
@@ -2738,7 +2945,8 @@ pspsky_ui_action_t pspsky_ui_timeline_frame(const pspsky_ui_timeline_view_t *vie
             /* intraFont may change the scissor. */
             sceGuScissor(0, s_vis_top, UI_SCR_W, s_vis_bottom - s_vis_top);
             ui_draw_post(&view->posts[i], i, top, view->now_unix,
-                         ui_tl_images(view, i), ui_avatar(view, i));
+                         ui_post_images(view, i), ui_quote_images(view, i),
+                         ui_avatar(view, i));
         }
         if (s_layout_more) {
             int y = UI_PAD_TOP + s_post_top[n] - s_scroll;

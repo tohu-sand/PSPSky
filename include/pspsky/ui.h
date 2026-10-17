@@ -33,6 +33,12 @@ typedef enum {
 #define PSPSKY_UI_TL_GRID_ROW_H 120
 #define PSPSKY_UI_TL_GRID_GAP   4
 
+/* Quoted images follow the same rules with lower heights inside the card. */
+#define PSPSKY_UI_QT_IMG_MAX_W  402  /* quote card content width */
+#define PSPSKY_UI_QT_IMG_MAX_H  140
+#define PSPSKY_UI_QT_GRID_COL_W 199
+#define PSPSKY_UI_QT_GRID_ROW_H 80
+
 #define PSPSKY_UI_AVATAR_PX    32
 
 /*
@@ -41,12 +47,15 @@ typedef enum {
  */
 typedef struct {
     const unsigned short *tex;  /* from pspsky_ui_tl_image_make(); NULL = marker only */
-    short w;  /* within pspsky_ui_tl_image_max() when tex is set */
+    short w;  /* within the decode bounds of its post or quote */
     short h;
 } pspsky_ui_tl_image_t;
 
 /* Decode bounds for each image of a post with count images. */
 void   pspsky_ui_tl_image_max(int count, int *max_w, int *max_h);
+
+/* Decode bounds for each image of a quoted post; within the post bounds. */
+void   pspsky_ui_quote_image_max(int count, int *max_w, int *max_h);
 
 /* Bytes that pspsky_ui_tl_image_make() allocates for a w x h image. */
 size_t pspsky_ui_tl_image_bytes(int w, int h);
@@ -76,6 +85,8 @@ typedef struct {
     long long now_unix;  /* reference for relative times */
     const char *my_handle;  /* shown in the header; may be NULL */
     const pspsky_ui_tl_image_t (*images)[PSPSKY_MAX_IMAGES];  /* NULL = no thumbnails */
+    /* Quoted post thumbnails, parallel to posts; NULL = none. */
+    const pspsky_ui_tl_image_t (*quote_images)[PSPSKY_MAX_IMAGES];
     const pspsky_ui_avatar_t   *avatars;  /* parallel to posts; NULL = default avatars */
 } pspsky_ui_timeline_view_t;
 
