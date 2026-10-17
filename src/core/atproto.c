@@ -24,7 +24,13 @@
 #define EMBED_IMAGES_TYPE  "app.bsky.embed.images"
 
 #define EMBED_IMAGES_VIEW  "app.bsky.embed.images#view"
+#define EMBED_RECORD_VIEW  "app.bsky.embed.record#view"
 #define EMBED_RWM_VIEW     "app.bsky.embed.recordWithMedia#view"
+
+#define QUOTE_RECORD       "app.bsky.embed.record#viewRecord"
+#define QUOTE_NOT_FOUND    "app.bsky.embed.record#viewNotFound"
+#define QUOTE_BLOCKED      "app.bsky.embed.record#viewBlocked"
+#define QUOTE_DETACHED     "app.bsky.embed.record#viewDetached"
 
 /* Only link facets are rendered. */
 #define FACET_LINK_FEATURE "app.bsky.richtext.facet#link"
@@ -476,14 +482,13 @@ cleanup:
     return rc;
 }
 
-/* Read image media only; quoted record contents may contain engagement data. */
-static const cJSON *embed_view_images(const cJSON *post)
+/* Image views of an embed view, including the media of recordWithMedia. */
+static const cJSON *embed_view_images(const cJSON *embed)
 {
-    const cJSON *embed = json_obj(post, "embed");
     const cJSON *images = NULL;
     const char  *type;
 
-    if (embed == NULL) {
+    if (!cJSON_IsObject(embed)) {
         return NULL;
     }
     type = json_str(embed, "$type");
@@ -505,30 +510,32 @@ static const cJSON *embed_view_images(const cJSON *post)
     return cJSON_IsArray(images) ? images : NULL;
 }
 
-/* Keep missing images in place so placeholders preserve embed order. */
-static void post_read_images(const cJSON *post, pspsky_post_t *p)
+/*
+ * Returns the image count. Keep missing images in place so placeholders
+ * preserve embed order.
+ */
+static int read_embed_images(const cJSON *embed, pspsky_post_image_t *out)
 {
-    const cJSON *images = embed_view_images(post);
+    const cJSON *images = embed_view_images(embed);
     int          n;
     int          i;
 
     if (images == NULL) {
-        return;
+        return 0;
     }
     n = cJSON_GetArraySize(images);
     if (n <= 0) {
-        return;
+        return 0;
     }
     if (n > PSPSKY_MAX_IMAGES) {
         n = PSPSKY_MAX_IMAGES;
     }
-    p->img_count = n;
 
     for (i = 0; i < n; ++i) {
         const cJSON *entry = cJSON_GetArrayItem(images, i);
         const cJSON *ratio;
         const char  *thumb;
-        pspsky_post_image_t *image = &p->images[i];
+        pspsky_post_image_t *image = &out[i];
         int w;
         int h;
 
@@ -552,6 +559,7 @@ static void post_read_images(const cJSON *post, pspsky_post_t *p)
             image->aspect_h = h;
         }
     }
+    return n;
 }
 
 static int facet_has_link(const cJSON *facet)
@@ -742,6 +750,84 @@ static void post_read_reply(const cJSON *item, const cJSON *record,
     p->reply = PSPSKY_REPLY_TO;
 }
 
+/* recordWithMedia nests a record#view whose $type is optional. */
+static const cJSON *embed_view_quote(const cJSON *embed)
+{
+    const char *type = json_str(embed, "$type");
+
+    if (type == NULL) {
+        return NULL;
+    }
+    if (strcmp(type, EMBED_RWM_VIEW) == 0) {
+        embed = json_obj(embed, "record");
+    } else if (strcmp(type, EMBED_RECORD_VIEW) != 0) {
+        return NULL;
+    }
+    return (embed != NULL) ? json_obj(embed, "record") : NULL;
+}
+
+/*
+ * viewRecord also carries engagement counts and viewer state; read only the
+ * fields kept in pspsky_quote_t.
+ */
+static void post_read_quote(const cJSON *post, pspsky_post_t *p)
+{
+    const cJSON *view = embed_view_quote(json_obj(post, "embed"));
+    const cJSON *author;
+    const cJSON *value;
+    const cJSON *embeds;
+    pspsky_quote_t *q = &p->quoted;
+    const char  *type;
+    const char  *handle;
+    const char  *text;
+    const char  *created;
+
+    type = (view != NULL) ? json_str(view, "$type") : NULL;
+    if (type == NULL) {
+        return;
+    }
+    if (strcmp(type, QUOTE_NOT_FOUND) == 0) {
+        p->quote = PSPSKY_QUOTE_NOT_FOUND;
+        return;
+    }
+    if (strcmp(type, QUOTE_BLOCKED) == 0) {
+        p->quote = PSPSKY_QUOTE_BLOCKED;
+        return;
+    }
+    if (strcmp(type, QUOTE_DETACHED) == 0) {
+        p->quote = PSPSKY_QUOTE_DETACHED;
+        return;
+    }
+    if (strcmp(type, QUOTE_RECORD) != 0) {
+        return;  /* feeds, lists and other records are not shown */
+    }
+
+    author = json_obj(view, "author");
+    value  = json_obj(view, "value");
+    handle = (author != NULL) ? json_str(author, "handle") : NULL;
+    text   = (value != NULL) ? json_str(value, "text") : NULL;
+    if (handle == NULL || handle[0] == '\0' || text == NULL) {
+        p->quote = PSPSKY_QUOTE_NOT_FOUND;
+        return;
+    }
+
+    copy_utf8_trunc(q->handle,       sizeof(q->handle),       handle);
+    copy_utf8_trunc(q->display_name, sizeof(q->display_name),
+                    json_str(author, "displayName"));
+    copy_utf8_trunc(q->text,         sizeof(q->text),         text);
+    created = json_str(value, "createdAt");
+    q->created_at_unix = (created != NULL) ? pspsky_iso8601_parse(created) : -1;
+
+    /* A post has one embed at most; a nested quote is reduced to its media. */
+    embeds = cJSON_GetObjectItemCaseSensitive(view, "embeds");
+    if (cJSON_IsArray(embeds)) {
+        q->img_count = read_embed_images(cJSON_GetArrayItem(embeds, 0),
+                                         q->images);
+    }
+
+    p->quote = PSPSKY_QUOTE_POST;
+}
+
 /* Missing handle or text makes the caller skip this item. self_did may be NULL. */
 static int post_from_feed_item(const cJSON *item, const char *self_did,
                                pspsky_post_t *p)
@@ -782,8 +868,9 @@ static int post_from_feed_item(const cJSON *item, const char *self_did,
     p->has_embed =
         (cJSON_GetObjectItemCaseSensitive(record, "embed") != NULL) ? 1 : 0;
 
-    /* Thumbnail URLs come from the hydrated view, outside record. */
-    post_read_images(post, p);
+    /* Thumbnail URLs and quotes come from the hydrated view, outside record. */
+    p->img_count = read_embed_images(json_obj(post, "embed"), p->images);
+    post_read_quote(post, p);
 
     copy_utf8_trunc(p->handle,       sizeof(p->handle),       handle);
     copy_utf8_trunc(p->display_name, sizeof(p->display_name), display);

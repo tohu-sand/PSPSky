@@ -63,8 +63,9 @@ static int                g_post_count;
 static char               g_cursor[PSPSKY_MAX_CURSOR];
 static int                g_has_more;
 
-/* Owns thumbnail textures; the UI borrows them. */
+/* Owns thumbnail textures; the UI borrows them. Quotes share the budget. */
 static pspsky_ui_tl_image_t g_tl_images[APP_MAX_POSTS][PSPSKY_MAX_IMAGES];
+static pspsky_ui_tl_image_t g_quote_images[APP_MAX_POSTS][PSPSKY_MAX_IMAGES];
 static size_t               g_img_cache_bytes;
 /* Shared decode scratch for thumbnails and avatars. */
 static unsigned char g_img_work[PSPSKY_UI_TL_IMG_MAX_W *
@@ -367,9 +368,11 @@ static void img_cache_clear(void)
     for (i = 0; i < APP_MAX_POSTS; i++) {
         for (j = 0; j < PSPSKY_MAX_IMAGES; j++) {
             free((void *)g_tl_images[i][j].tex);
+            free((void *)g_quote_images[i][j].tex);
         }
     }
     memset(g_tl_images, 0, sizeof(g_tl_images));
+    memset(g_quote_images, 0, sizeof(g_quote_images));
     memset(g_post_avatars, 0, sizeof(g_post_avatars));
     g_img_cache_bytes = 0;
 }
@@ -507,11 +510,81 @@ static int avatar_add(const char *url)
     return g_avatar_count++;
 }
 
+static int thumb_url_count(const pspsky_post_image_t *images, int count)
+{
+    int n = 0;
+    int j;
+
+    for (j = 0; j < count && j < PSPSKY_MAX_IMAGES; j++) {
+        if (images[j].thumb_url[0] != '\0') {
+            n++;
+        }
+    }
+    return n;
+}
+
+/*
+ * Each image with a URL advances *n, the position shown against m in the
+ * status line, even when the decoded image cache is full.
+ */
+static void fetch_thumbs(const pspsky_post_image_t *src, int count,
+                         int max_w, int max_h, pspsky_ui_tl_image_t *dst,
+                         int *n, int m)
+{
+    char msg[128];
+    int  j;
+
+    for (j = 0; j < count && j < PSPSKY_MAX_IMAGES; j++) {
+        unsigned char *body = NULL;
+        size_t         len  = 0;
+        size_t         sz;
+        int            tw   = 0;
+        int            th   = 0;
+        int            sw   = 0;
+        int            sh   = 0;
+        int            decoded;
+
+        if (src[j].thumb_url[0] == '\0') {
+            continue;
+        }
+        (*n)++;
+        /* Skip transfers once the decoded image cache is full. */
+        if (g_img_cache_bytes >= (size_t)APP_IMG_CACHE_MAX) {
+            continue;
+        }
+
+        snprintf(msg, sizeof(msg), pspsky_tr(PSPSKY_STR_ST_FETCHING_IMAGES),
+                 *n, m);
+        pspsky_ui_status(msg);
+
+        decoded = 0;
+        if (pspsky_atp_fetch_image(&g_transport, src[j].thumb_url,
+                                   &body, &len, NULL) == PSPSKY_OK &&
+            pspsky_webp_thumb_decode(body, len, max_w, max_h,
+                                     g_img_work, sizeof(g_img_work),
+                                     &tw, &th, &sw, &sh) == PSPSKY_OK) {
+            decoded = 1;
+        }
+        free(body);
+        if (!decoded) {
+            printf("PSPSky: thumbnail unavailable: %s\n", src[j].thumb_url);
+            continue;
+        }
+
+        sz = pspsky_ui_tl_image_bytes(tw, th);
+        if (g_img_cache_bytes + sz > (size_t)APP_IMG_CACHE_MAX ||
+            pspsky_ui_tl_image_make(&dst[j], g_img_work, tw, th) != PSPSKY_OK) {
+            continue;
+        }
+        g_img_cache_bytes += sz;
+    }
+}
+
 /* Failed image requests leave placeholders without interrupting the timeline. */
 static void fetch_new_images(int start)
 {
     char msg[128];
-    int  i, j;
+    int  i;
     int  m = 0;
     int  n = 0;
     int  room = APP_AVATAR_MAX - g_avatar_count;
@@ -520,14 +593,15 @@ static void fetch_new_images(int start)
         return;
     }
     for (i = start; i < g_post_count; i++) {
+        const pspsky_post_t *p = &g_posts[i];
+
         if (room > 0 && avatar_pending(start, i)) {
             room--;
             m++;
         }
-        for (j = 0; j < g_posts[i].img_count && j < PSPSKY_MAX_IMAGES; j++) {
-            if (g_posts[i].images[j].thumb_url[0] != '\0') {
-                m++;
-            }
+        m += thumb_url_count(p->images, p->img_count);
+        if (p->quote == PSPSKY_QUOTE_POST) {
+            m += thumb_url_count(p->quoted.images, p->quoted.img_count);
         }
     }
 
@@ -551,55 +625,18 @@ static void fetch_new_images(int start)
         }
     }
 
+    /* Post order keeps the cache budget for the posts read first. */
     for (i = start; i < g_post_count; i++) {
+        const pspsky_post_t *p = &g_posts[i];
         int max_w, max_h;
 
-        pspsky_ui_tl_image_max(g_posts[i].img_count, &max_w, &max_h);
-        for (j = 0; j < g_posts[i].img_count && j < PSPSKY_MAX_IMAGES; j++) {
-            unsigned char *body = NULL;
-            size_t         len  = 0;
-            size_t         sz;
-            int            tw   = 0;
-            int            th   = 0;
-            int            sw   = 0;
-            int            sh   = 0;
-            int            decoded;
-
-            if (g_posts[i].images[j].thumb_url[0] == '\0') {
-                continue;
-            }
-            n++;
-            /* Skip transfers once the decoded image cache is full. */
-            if (g_img_cache_bytes >= (size_t)APP_IMG_CACHE_MAX) {
-                continue;
-            }
-
-            snprintf(msg, sizeof(msg), pspsky_tr(PSPSKY_STR_ST_FETCHING_IMAGES),
-                     n, m);
-            pspsky_ui_status(msg);
-
-            decoded = 0;
-            if (pspsky_atp_fetch_image(&g_transport,
-                                       g_posts[i].images[j].thumb_url,
-                                       &body, &len, NULL) == PSPSKY_OK &&
-                pspsky_webp_thumb_decode(body, len, max_w, max_h,
-                                         g_img_work, sizeof(g_img_work),
-                                         &tw, &th, &sw, &sh) == PSPSKY_OK) {
-                decoded = 1;
-            }
-            free(body);
-            if (!decoded) {
-                printf("PSPSky: thumbnail %d/%d unavailable\n", i, j);
-                continue;
-            }
-
-            sz = pspsky_ui_tl_image_bytes(tw, th);
-            if (g_img_cache_bytes + sz > (size_t)APP_IMG_CACHE_MAX ||
-                pspsky_ui_tl_image_make(&g_tl_images[i][j], g_img_work,
-                                        tw, th) != PSPSKY_OK) {
-                continue;
-            }
-            g_img_cache_bytes += sz;
+        pspsky_ui_tl_image_max(p->img_count, &max_w, &max_h);
+        fetch_thumbs(p->images, p->img_count, max_w, max_h, g_tl_images[i],
+                     &n, m);
+        if (p->quote == PSPSKY_QUOTE_POST) {
+            pspsky_ui_quote_image_max(p->quoted.img_count, &max_w, &max_h);
+            fetch_thumbs(p->quoted.images, p->quoted.img_count, max_w, max_h,
+                         g_quote_images[i], &n, m);
         }
     }
 }
@@ -1093,13 +1130,14 @@ static void app_main_loop(void)
     int rc;
 
     while (!g_exit_requested) {
-        view.posts     = g_posts;
-        view.count     = g_post_count;
-        view.has_more  = g_has_more;
-        view.now_unix  = now_unix();
-        view.my_handle = g_client.session.handle;
-        view.images    = g_tl_images;
-        view.avatars   = g_post_avatars;
+        view.posts        = g_posts;
+        view.count        = g_post_count;
+        view.has_more     = g_has_more;
+        view.now_unix     = now_unix();
+        view.my_handle    = g_client.session.handle;
+        view.images       = g_tl_images;
+        view.quote_images = g_quote_images;
+        view.avatars      = g_post_avatars;
 
         act = pspsky_ui_timeline_frame(&view);
         rc  = PSPSKY_OK;

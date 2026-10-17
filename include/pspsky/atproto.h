@@ -39,11 +39,27 @@ typedef struct {
 #define PSPSKY_REPLY_TO_POST    3  /* the parent was deleted or not hydrated */
 #define PSPSKY_REPLY_TO_BLOCKED 4  /* the parent is hidden by a block */
 
+#define PSPSKY_QUOTE_NONE       0  /* no quote, or a feed, list or other record */
+#define PSPSKY_QUOTE_POST       1  /* quoted holds the quoted post */
+#define PSPSKY_QUOTE_NOT_FOUND  2  /* deleted or not hydrated */
+#define PSPSKY_QUOTE_BLOCKED    3
+#define PSPSKY_QUOTE_DETACHED   4  /* the quoted author removed the quote */
+
 typedef struct {
     char thumb_url[PSPSKY_MAX_THUMB_URL];  /* empty = unavailable */
     int  aspect_w;  /* both 0 when unknown */
     int  aspect_h;
 } pspsky_post_image_t;
+
+/* The quoted post's avatar is not fetched. */
+typedef struct {
+    char display_name[PSPSKY_MAX_DISPLAYNAME];  /* empty = UI shows the handle */
+    char handle[PSPSKY_MAX_HANDLE];
+    char text[PSPSKY_MAX_TEXT];
+    long long created_at_unix;  /* -1 if unparsable */
+    pspsky_post_image_t images[PSPSKY_MAX_IMAGES];  /* same rules as the post's */
+    int  img_count;  /* 0..PSPSKY_MAX_IMAGES */
+} pspsky_quote_t;
 
 typedef struct {
     char display_name[PSPSKY_MAX_DISPLAYNAME];  /* empty = UI shows the handle */
@@ -63,9 +79,11 @@ typedef struct {
     char repost_by[PSPSKY_MAX_DISPLAYNAME];  /* reposter's display name, else handle */
     int  reply;  /* PSPSKY_REPLY_* */
     char reply_to[PSPSKY_MAX_DISPLAYNAME];  /* parent author's display name, else handle */
+    int  quote;  /* PSPSKY_QUOTE_* */
+    pspsky_quote_t quoted;  /* zeroed unless quote is PSPSKY_QUOTE_POST */
 } pspsky_post_t;
 
-/* Keep this struct off the stack (about 64 KiB). */
+/* Keep this struct off the stack (about 114 KiB). */
 typedef struct {
     pspsky_post_t posts[PSPSKY_MAX_POSTS];
     int  count;

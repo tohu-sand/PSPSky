@@ -4,7 +4,7 @@
 
 A [Bluesky](https://bsky.app) client for the PSP (PlayStation Portable). It connects directly to `bsky.social` over TLS 1.2 to read the timeline and post. No relay server is required.
 
-![The PSPSky timeline screen](assets/screenshot-timeline.png)
+![The PSPSky timeline screen](assets/screenshot-timeline_en.png)
 
 ## Features
 
@@ -12,7 +12,7 @@ A [Bluesky](https://bsky.app) client for the PSP (PlayStation Portable). It conn
 - Write text posts of up to 300 characters, with Japanese input support.
 - Attach up to four JPEG or PNG images per post, up to 2,000,000 bytes each, with optional ALT text for each image.
 
-Quote post and link card contents are not displayed.
+Link card contents are not displayed.
 
 ## Requirements
 
