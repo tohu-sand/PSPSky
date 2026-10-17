@@ -22,19 +22,42 @@ typedef enum {
 
 #define PSPSKY_UI_PICK_PATH_MAX 512
 
-#define PSPSKY_UI_TL_IMG_MAX_W 256
-#define PSPSKY_UI_TL_IMG_MAX_H 120
-#define PSPSKY_UI_TL_GRID_COL_W 200
+/*
+ * One-row layouts (one or two images) may use the full height; three or four
+ * images use two rows of at most GRID_ROW_H. Each row is as tall as its
+ * tallest image.
+ */
+#define PSPSKY_UI_TL_IMG_MAX_W  418  /* timeline content width */
+#define PSPSKY_UI_TL_IMG_MAX_H  200
+#define PSPSKY_UI_TL_GRID_COL_W 207
+#define PSPSKY_UI_TL_GRID_ROW_H 120
 #define PSPSKY_UI_TL_GRID_GAP   4
 
 #define PSPSKY_UI_AVATAR_PX    32
 
-/* Main-owned thumbnails, indexed by post and image. */
+/*
+ * Main-owned thumbnails, indexed by post and image. tex is drawn directly by
+ * the GE, so free it only after pspsky_ui_timeline_invalidate().
+ */
 typedef struct {
-    const unsigned char *rgb;  /* packed RGB888, stride w * 3; NULL = marker only */
-    short w;  /* 1..PSPSKY_UI_TL_IMG_MAX_W when rgb is set */
-    short h;  /* 1..PSPSKY_UI_TL_IMG_MAX_H when rgb is set */
+    const unsigned short *tex;  /* from pspsky_ui_tl_image_make(); NULL = marker only */
+    short w;  /* within pspsky_ui_tl_image_max() when tex is set */
+    short h;
 } pspsky_ui_tl_image_t;
+
+/* Decode bounds for each image of a post with count images. */
+void   pspsky_ui_tl_image_max(int count, int *max_w, int *max_h);
+
+/* Bytes that pspsky_ui_tl_image_make() allocates for a w x h image. */
+size_t pspsky_ui_tl_image_bytes(int w, int h);
+
+/*
+ * Converts packed RGB888 (stride w * 3) into an RGB565 texture. The caller
+ * releases out->tex with free(). Returns PSPSKY_OK, PSPSKY_E_ARG or
+ * PSPSKY_E_NOMEM.
+ */
+int    pspsky_ui_tl_image_make(pspsky_ui_tl_image_t *out,
+                               const unsigned char *rgb, int w, int h);
 
 /*
  * Main-owned avatars parallel the posts array. Posts by the same author may
