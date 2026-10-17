@@ -1,3 +1,4 @@
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,21 +117,23 @@
 #define UI_PICK_REPEAT_DELAY 20  /* frames before repeat */
 #define UI_PICK_REPEAT_RATE  4  /* frames between repeats */
 
-/*
- * Twelve 256x128 textures use 1.5 MiB. Interior image rows need at least 38 px
- * per texture; two partially visible edge rows need at most four textures. At
- * most floor(272/38) + 4 = 11 textures are visible. Current-frame slots stay
- * pinned.
- */
-#define UI_TL_TEX_SLOTS   12
-#define UI_TL_TEX_W       256
-#define UI_TL_TEX_H       128
+#if PSPSKY_UI_TL_IMG_MAX_W > UI_CONTENT_W || \
+    2 * PSPSKY_UI_TL_GRID_COL_W + PSPSKY_UI_TL_GRID_GAP > UI_CONTENT_W || \
+    PSPSKY_UI_TL_GRID_ROW_H > PSPSKY_UI_TL_IMG_MAX_H
+#error "timeline image bounds exceed the content column"
+#endif
+
+/* Inverted corner coverage, one quadrant per corner. */
+#define UI_CORNER_TEX     16
+#if 2 * UI_IMG_RADIUS > UI_CORNER_TEX
+#error "UI_CORNER_TEX must hold four UI_IMG_RADIUS quadrants"
+#endif
 
 /* Sixteen avatars cover one screen and use 64 KiB. */
 #define UI_AV_SLOTS       16
 
-#define UI_PREV_MAX_DIM   512  /* power-of-two texture limits */
-#define UI_PREV_MIN_DIM   16
+#define UI_TEX_MAX_DIM    512  /* power-of-two texture limits */
+#define UI_TEX_MIN_DIM    16
 #define UI_PREV_AREA_Y    32
 #define UI_PREV_AREA_W    440
 #define UI_PREV_AREA_H    170
@@ -221,19 +224,7 @@ static char            s_pick_path[PSPSKY_UI_PICK_PATH_MAX];
 
 /* 1 MiB preview texture; image data occupies the top-left region. */
 static unsigned int __attribute__((aligned(64)))
-    s_prev_tex[UI_PREV_MAX_DIM * UI_PREV_MAX_DIM];
-
-/*
- * Slots are keyed by post/image index (-1 post = empty). Invalidate before
- * main changes indices or frees RGB buffers. Referenced slots stay pinned
- * until the GU frame completes.
- */
-static unsigned int __attribute__((aligned(16)))
-    s_tl_tex[UI_TL_TEX_SLOTS][UI_TL_TEX_W * UI_TL_TEX_H];
-static int s_tl_tex_post[UI_TL_TEX_SLOTS];
-static int s_tl_tex_image[UI_TL_TEX_SLOTS];
-static unsigned char s_tl_tex_pinned[UI_TL_TEX_SLOTS];
-static int s_tl_tex_next = 0;  /* round robin */
+    s_prev_tex[UI_TEX_MAX_DIM * UI_TEX_MAX_DIM];
 
 /* LRU cache keyed by main-owned RGB buffers; invalidated with thumbnails. */
 static unsigned int __attribute__((aligned(16)))
@@ -245,8 +236,20 @@ static unsigned int         s_av_used[UI_AV_SLOTS];  /* s_frame of the last draw
 static unsigned int __attribute__((aligned(16)))
     s_atlas[UI_ATLAS_W * UI_ATLAS_H];
 
-/* Coverage of a thumbnail's top-left corner; the others are mirrored. */
-static unsigned char s_corner_a[UI_IMG_RADIUS][UI_IMG_RADIUS];
+/*
+ * RGB565 thumbnails have no alpha, so their corners are rounded by drawing
+ * the surrounding color through this mask (white RGB, 255 - coverage alpha).
+ */
+static unsigned int __attribute__((aligned(16)))
+    s_corner_tex[UI_CORNER_TEX * UI_CORNER_TEX];
+
+/* 4x4 ordered dither for RGB565 quantization. */
+static const unsigned char k_ui_dither[4][4] = {
+    {  0,  8,  2, 10 },
+    { 12,  4, 14,  6 },
+    {  3, 11,  1,  9 },
+    { 15,  7, 13,  5 }
+};
 
 typedef struct {
     unsigned int color;
@@ -325,7 +328,8 @@ static void ui_atlas_bind(void)
     s_tex = UI_TEX_ATLAS;
 }
 
-static void ui_atlas_draw(const ui_quad_t *q, int n, unsigned int color)
+/* Draws with the currently bound texture. */
+static void ui_quads_draw(const ui_quad_t *q, int n, unsigned int color)
 {
     ui_tc_vertex_t *v;
     int             i;
@@ -351,11 +355,16 @@ static void ui_atlas_draw(const ui_quad_t *q, int n, unsigned int color)
         v[2 * i + 1].y     = q[i].y1;
         v[2 * i + 1].z     = 0.0f;
     }
-    ui_atlas_bind();
     sceGuDrawArray(GU_SPRITES,
                    GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF |
                    GU_TRANSFORM_2D,
                    n * 2, 0, v);
+}
+
+static void ui_atlas_draw(const ui_quad_t *q, int n, unsigned int color)
+{
+    ui_atlas_bind();
+    ui_quads_draw(q, n, color);
 }
 
 static void ui_icon_scaled(int icon, float x, float y, float w, float h,
@@ -382,17 +391,16 @@ static void ui_icon(int icon, int x, int y, unsigned int color)
     ui_icon_scaled(icon, (float)x, (float)y, (float)r[2], (float)r[3], color);
 }
 
-static void ui_corners(int icon, int x, int y, int w, int h, int r,
-                       unsigned int color)
+/* Splits the texel rect c into quadrants placed at the corners of x, y, w, h. */
+static void ui_corner_quads(const unsigned char *c, int x, int y, int w, int h,
+                            int r, ui_quad_t q[4])
 {
-    const unsigned char *c = k_ui_icon_rect[icon];
     float     u0 = (float)c[0];
     float     v0 = (float)c[1];
     float     um = (float)c[0] + (float)c[2] * 0.5f;
     float     vm = (float)c[1] + (float)c[3] * 0.5f;
     float     u1 = (float)(c[0] + c[2]);
     float     v1 = (float)(c[1] + c[3]);
-    ui_quad_t q[4];
     int       i;
 
     for (i = 0; i < 4; i++) {
@@ -410,7 +418,39 @@ static void ui_corners(int icon, int x, int y, int w, int h, int r,
         q[i].x1 = (float)(dx + r);
         q[i].y1 = (float)(dy + r);
     }
+}
+
+static void ui_corners(int icon, int x, int y, int w, int h, int r,
+                       unsigned int color)
+{
+    ui_quad_t q[4];
+
+    ui_corner_quads(k_ui_icon_rect[icon], x, y, w, h, r, q);
     ui_atlas_draw(q, 4, color);
+}
+
+/* Paints color outside the rounded corners of x, y, w, h. */
+static void ui_mask_corners(int x, int y, int w, int h, unsigned int color)
+{
+    static const unsigned char rect[4] = {
+        0, 0, 2 * UI_IMG_RADIUS, 2 * UI_IMG_RADIUS
+    };
+    ui_quad_t q[4];
+
+    if (w < 2 * UI_IMG_RADIUS || h < 2 * UI_IMG_RADIUS) {
+        return;
+    }
+    ui_corner_quads(rect, x, y, w, h, UI_IMG_RADIUS, q);
+    /* intraFont re-enables depth testing. */
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, UI_CORNER_TEX, UI_CORNER_TEX, UI_CORNER_TEX, s_corner_tex);
+    sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);  /* unscaled texture */
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    s_tex = UI_TEX_OTHER;
+    ui_quads_draw(q, 4, color);
 }
 
 /* Keep pieces disjoint so translucent colors blend evenly. */
@@ -475,8 +515,8 @@ static void ui_frame_begin(void)
     sceGuClearDepth(0);
     sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
     s_tex = UI_TEX_NONE;
-    /* ui_frame_end() waits for the GE before these slots are reused. */
-    memset(s_tl_tex_pinned, 0, sizeof s_tl_tex_pinned);
+    /* Main may reuse freed thumbnail memory for new textures between frames. */
+    sceGuTexFlush();
     s_frame++;
 }
 
@@ -766,20 +806,38 @@ static int ui_image_count(const pspsky_post_t *post)
            PSPSKY_MAX_IMAGES : post->img_count;
 }
 
+/* GE buffer widths for 16-bit texels must be multiples of eight. */
+static int ui_tl_stride(int w)
+{
+    return (w + 7) & ~7;
+}
+
+/* PSP texture sides must be powers of two. */
+static int ui_tex_pow2(int v)
+{
+    int p = UI_TEX_MIN_DIM;
+
+    while (p < v && p < UI_TEX_MAX_DIM) {
+        p <<= 1;
+    }
+    return p;
+}
+
 /* Layout and drawing must use the same image validity checks. */
 static const pspsky_ui_tl_image_t *ui_tl_image(const pspsky_ui_tl_image_t *images,
                                               int image, int count)
 {
     const pspsky_ui_tl_image_t *img;
-    int max_w = (count > 1) ? PSPSKY_UI_TL_GRID_COL_W : PSPSKY_UI_TL_IMG_MAX_W;
+    int max_w, max_h;
 
     if (images == NULL || image < 0 || image >= count) {
         return NULL;
     }
+    pspsky_ui_tl_image_max(count, &max_w, &max_h);
     img = &images[image];
-    if (img->rgb == NULL ||
+    if (img->tex == NULL ||
         img->w < 1 || img->w > max_w ||
-        img->h < 1 || img->h > PSPSKY_UI_TL_IMG_MAX_H) {
+        img->h < 1 || img->h > max_h) {
         return NULL;
     }
     return img;
@@ -811,19 +869,42 @@ static const pspsky_ui_avatar_t *ui_avatar(const pspsky_ui_timeline_view_t *view
     return (view->avatars != NULL) ? &view->avatars[idx] : NULL;
 }
 
+/* A row with no available image falls back to the decode bound. */
+static int ui_tl_row_h(const pspsky_ui_tl_image_t *images, int count, int row)
+{
+    int h = 0;
+    int max_w, max_h, i;
+
+    for (i = 2 * row; i < count && i < 2 * row + 2; i++) {
+        const pspsky_ui_tl_image_t *img = ui_tl_image(images, i, count);
+
+        if (img != NULL && img->h > h) {
+            h = img->h;
+        }
+    }
+    if (h == 0) {
+        pspsky_ui_tl_image_max(count, &max_w, &max_h);
+        h = max_h;
+    }
+    return h;
+}
+
 /* Must match the attachment layout in ui_draw_post(). */
 static int ui_post_extra_h(const pspsky_post_t *post,
                            const pspsky_ui_tl_image_t *images)
 {
     if (images != NULL) {
         int count = ui_image_count(post);
-        int rows = (count + 1) / 2;
+        int h     = UI_TL_IMG_GAP - PSPSKY_UI_TL_GRID_GAP;
+        int row;
 
         if (count == 1) {
             return UI_TL_IMG_GAP + images[0].h;
         }
-        return UI_TL_IMG_GAP + rows * PSPSKY_UI_TL_IMG_MAX_H +
-               (rows - 1) * PSPSKY_UI_TL_GRID_GAP;
+        for (row = 0; 2 * row < count; row++) {
+            h += PSPSKY_UI_TL_GRID_GAP + ui_tl_row_h(images, count, row);
+        }
+        return h;
     }
     if (post->img_count >= 1) {
         return UI_TL_IMG_GAP + UI_CHIP_H;
@@ -841,80 +922,7 @@ static const char *ui_img_mark(const pspsky_post_t *post, char *buf, size_t cap)
     return buf;
 }
 
-static void ui_round_corners(unsigned int *tex, int stride, int w, int h)
-{
-    int x, y;
-
-    if (w < 2 * UI_IMG_RADIUS || h < 2 * UI_IMG_RADIUS) {
-        return;
-    }
-    for (y = 0; y < UI_IMG_RADIUS; y++) {
-        unsigned int *top = tex + (size_t)y * (size_t)stride;
-        unsigned int *bot = tex + (size_t)(h - 1 - y) * (size_t)stride;
-
-        for (x = 0; x < UI_IMG_RADIUS; x++) {
-            unsigned int a = (unsigned int)s_corner_a[y][x] << 24;
-
-            top[x]         = (top[x] & 0x00FFFFFFu) | a;
-            top[w - 1 - x] = (top[w - 1 - x] & 0x00FFFFFFu) | a;
-            bot[x]         = (bot[x] & 0x00FFFFFFu) | a;
-            bot[w - 1 - x] = (bot[w - 1 - x] & 0x00FFFFFFu) | a;
-        }
-    }
-}
-
-/*
- * Upload on a cache miss. Never overwrite a texture queued in the current
- * asynchronous GU frame.
- */
-static const unsigned int *ui_tl_tex_bind(int idx, int image,
-                                          const pspsky_ui_tl_image_t *img)
-{
-    unsigned int *tex;
-    int           slot, attempt, x, y;
-
-    for (slot = 0; slot < UI_TL_TEX_SLOTS; slot++) {
-        if (s_tl_tex_post[slot] == idx && s_tl_tex_image[slot] == image) {
-            s_tl_tex_pinned[slot] = 1;
-            return s_tl_tex[slot];
-        }
-    }
-    for (attempt = 0; attempt < UI_TL_TEX_SLOTS; attempt++) {
-        slot = (s_tl_tex_next + attempt) % UI_TL_TEX_SLOTS;
-        if (!s_tl_tex_pinned[slot]) {
-            break;
-        }
-    }
-    if (attempt == UI_TL_TEX_SLOTS) {
-        return NULL;
-    }
-    s_tl_tex_next = (slot + 1) % UI_TL_TEX_SLOTS;
-    tex           = s_tl_tex[slot];
-
-    for (y = 0; y < img->h; y++) {
-        const unsigned char *src = img->rgb + (size_t)y * (size_t)img->w * 3u;
-        unsigned int        *dst = tex + (size_t)y * (size_t)UI_TL_TEX_W;
-
-        for (x = 0; x < img->w; x++) {
-            dst[x] = 0xFF000000u |
-                     ((unsigned int)src[x * 3 + 2] << 16) |
-                     ((unsigned int)src[x * 3 + 1] << 8) |
-                     (unsigned int)src[x * 3 + 0];
-        }
-    }
-    ui_round_corners(tex, UI_TL_TEX_W, img->w, img->h);
-    sceKernelDcacheWritebackRange(tex,
-                                  (unsigned int)UI_TL_TEX_W * 4u *
-                                  (unsigned int)img->h);
-    /* Flush any cached texels from the previous slot contents. */
-    sceGuTexFlush();
-    s_tl_tex_post[slot] = idx;
-    s_tl_tex_image[slot] = image;
-    s_tl_tex_pinned[slot] = 1;
-    return tex;
-}
-
-static void ui_draw_tex(const unsigned int *tex, int tw, int th,
+static void ui_draw_tex(int psm, const void *tex, int tw, int th, int tbw,
                         int w, int h, int x, int y)
 {
     ui_tex_vertex_f_t *v;
@@ -937,9 +945,11 @@ static void ui_draw_tex(const unsigned int *tex, int tw, int th,
     /* intraFont re-enables depth testing. */
     sceGuDisable(GU_DEPTH_TEST);
     sceGuEnable(GU_TEXTURE_2D);
-    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
-    sceGuTexImage(0, tw, th, tw, tex);
-    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+    sceGuTexMode(psm, 0, 0, 0);
+    sceGuTexImage(0, tw, th, tbw, tex);
+    /* RGB565 has no alpha channel; take it from the opaque color. */
+    sceGuTexFunc(GU_TFX_REPLACE,
+                 (psm == GU_PSM_5650) ? GU_TCC_RGB : GU_TCC_RGBA);
     sceGuTexFilter(GU_NEAREST, GU_NEAREST);  /* unscaled texture */
     sceGuTexWrap(GU_CLAMP, GU_CLAMP);
     sceGuColor(0xFFFFFFFF);
@@ -949,16 +959,14 @@ static void ui_draw_tex(const unsigned int *tex, int tw, int th,
     s_tex = UI_TEX_OTHER;
 }
 
-static int ui_tl_draw_image(int idx, int image, const pspsky_ui_tl_image_t *img,
-                            int x, int y)
+/* bg is the color around the image, used to round its corners. */
+static void ui_draw_tl_image(const pspsky_ui_tl_image_t *img, int x, int y,
+                             unsigned int bg)
 {
-    const unsigned int *tex = ui_tl_tex_bind(idx, image, img);
-
-    if (tex == NULL) {
-        return 0;
-    }
-    ui_draw_tex(tex, UI_TL_TEX_W, UI_TL_TEX_H, img->w, img->h, x, y);
-    return 1;
+    ui_draw_tex(GU_PSM_5650, img->tex, ui_tex_pow2(img->w),
+                ui_tex_pow2(img->h), ui_tl_stride(img->w),
+                img->w, img->h, x, y);
+    ui_mask_corners(x, y, img->w, img->h, bg);
 }
 
 static const unsigned int *ui_av_tex_bind(const unsigned char *rgb)
@@ -1010,8 +1018,8 @@ static void ui_draw_avatar(const pspsky_ui_avatar_t *av, int x, int y)
         ui_icon(UI_ICON_AVATAR32, x, y, UI_COL_TEXT);
         return;
     }
-    ui_draw_tex(ui_av_tex_bind(av->rgb), UI_AVATAR_PX, UI_AVATAR_PX,
-                UI_AVATAR_PX, UI_AVATAR_PX, x, y);
+    ui_draw_tex(GU_PSM_8888, ui_av_tex_bind(av->rgb), UI_AVATAR_PX,
+                UI_AVATAR_PX, UI_AVATAR_PX, UI_AVATAR_PX, UI_AVATAR_PX, x, y);
 }
 
 static void ui_draw_img_chip(const pspsky_post_t *post, int x, int y)
@@ -1032,6 +1040,32 @@ static void ui_draw_img_placeholder(int x, int y, int w, int h)
     ui_fill_rrect(x, y, w, h, UI_IMG_RADIUS, UI_COL_CARD);
     if (w >= 12 && h >= 12) {
         ui_icon(UI_ICON_PICTURE, x + (w - 12) / 2, y + (h - 12) / 2, UI_COL_MED);
+    }
+}
+
+/*
+ * Letterboxes img on a card. An image reaching the card's corner squares is
+ * masked again with the background outside the card's rounded corners.
+ */
+static void ui_draw_tl_cell(const pspsky_ui_tl_image_t *img, int x, int y, int h)
+{
+    const int w = PSPSKY_UI_TL_GRID_COL_W;
+    int       dx, dy;
+
+    if (img == NULL) {
+        ui_draw_img_placeholder(x, y, w, h);
+        return;
+    }
+    if (img->w == w && img->h == h) {
+        ui_draw_tl_image(img, x, y, UI_COL_BG);
+        return;
+    }
+    dx = (w - img->w) / 2;
+    dy = (h - img->h) / 2;
+    ui_fill_rrect(x, y, w, h, UI_IMG_RADIUS, UI_COL_CARD);
+    ui_draw_tl_image(img, x + dx, y + dy, UI_COL_CARD);
+    if (dx < UI_IMG_RADIUS && dy < UI_IMG_RADIUS) {
+        ui_mask_corners(x, y, w, h, UI_COL_BG);
     }
 }
 
@@ -1399,36 +1433,24 @@ static void ui_draw_post(const pspsky_post_t *post, int idx, int top,
         int iy = y + UI_TL_IMG_GAP;
 
         if (count == 1) {
-            const pspsky_ui_tl_image_t *img = &images[0];
-
-            if (ui_visible(iy, img->h) &&
-                !ui_tl_draw_image(idx, 0, img, UI_CONTENT_X, iy)) {
-                ui_draw_img_placeholder(UI_CONTENT_X, iy, img->w, img->h);
+            if (ui_visible(iy, images[0].h)) {
+                ui_draw_tl_image(&images[0], UI_CONTENT_X, iy, UI_COL_BG);
             }
         } else {
-            for (i = 0; i < count; i++) {
-                const pspsky_ui_tl_image_t *img = ui_tl_image(images, i, count);
-                int x = UI_CONTENT_X + (i % 2) *
-                        (PSPSKY_UI_TL_GRID_COL_W + PSPSKY_UI_TL_GRID_GAP);
-                int cy = iy + (i / 2) *
-                         (PSPSKY_UI_TL_IMG_MAX_H + PSPSKY_UI_TL_GRID_GAP);
+            int r;
 
-                if (!ui_visible(cy, PSPSKY_UI_TL_IMG_MAX_H)) {
-                    continue;
-                }
-                if (img != NULL) {
-                    int ix = x + (PSPSKY_UI_TL_GRID_COL_W - img->w) / 2;
-                    int image_y = cy + (PSPSKY_UI_TL_IMG_MAX_H - img->h) / 2;
+            for (r = 0; 2 * r < count; r++) {
+                int rh = ui_tl_row_h(images, count, r);
 
-                    ui_fill_rrect(x, cy, PSPSKY_UI_TL_GRID_COL_W,
-                                   PSPSKY_UI_TL_IMG_MAX_H, UI_IMG_RADIUS, UI_COL_CARD);
-                    if (!ui_visible(image_y, img->h) ||
-                        ui_tl_draw_image(idx, i, img, ix, image_y)) {
-                        continue;
-                    }
+                for (i = 2 * r; i < count && i < 2 * r + 2 &&
+                                ui_visible(iy, rh); i++) {
+                    ui_draw_tl_cell(ui_tl_image(images, i, count),
+                                    UI_CONTENT_X + (i % 2) *
+                                    (PSPSKY_UI_TL_GRID_COL_W +
+                                     PSPSKY_UI_TL_GRID_GAP),
+                                    iy, rh);
                 }
-                ui_draw_img_placeholder(x, cy, PSPSKY_UI_TL_GRID_COL_W,
-                                         PSPSKY_UI_TL_IMG_MAX_H);
+                iy += rh + PSPSKY_UI_TL_GRID_GAP;
             }
         }
     } else if (post->img_count >= 1) {
@@ -1962,17 +1984,6 @@ static void ui_pick_draw(int cursor, int top)
     ui_frame_end();
 }
 
-/* PSP texture sides must be powers of two. */
-static int ui_prev_pow2(int v)
-{
-    int p = UI_PREV_MIN_DIM;
-
-    while (p < v && p < UI_PREV_MAX_DIM) {
-        p <<= 1;
-    }
-    return p;
-}
-
 /* Convert RGB888 to GU_PSM_8888 before entering the preview loop. */
 static void ui_prev_upload(const pspsky_ui_preview_t *pv, int potw, int poth)
 {
@@ -2132,15 +2143,20 @@ static void ui_build_atlas(void)
     sceKernelDcacheWritebackRange(s_atlas, sizeof s_atlas);
 }
 
-/* Top-left corner coverage, sampled at 4x4 subpixels per pixel. */
+/*
+ * Top-left corner coverage, sampled at 4x4 subpixels per pixel and mirrored
+ * into the other quadrants.
+ */
 static void ui_build_corner_mask(void)
 {
+    const int   e = 2 * UI_IMG_RADIUS - 1;
     const float r = (float)UI_IMG_RADIUS;
     int         x, y, i, j;
 
     for (y = 0; y < UI_IMG_RADIUS; y++) {
         for (x = 0; x < UI_IMG_RADIUS; x++) {
-            int in = 0;
+            unsigned int t;
+            int          in = 0;
 
             for (j = 0; j < 4; j++) {
                 for (i = 0; i < 4; i++) {
@@ -2152,9 +2168,15 @@ static void ui_build_corner_mask(void)
                     }
                 }
             }
-            s_corner_a[y][x] = (unsigned char)((in * 255 + 8) / 16);
+            t = ((255u - (unsigned int)((in * 255 + 8) / 16)) << 24) |
+                0x00FFFFFFu;
+            s_corner_tex[y * UI_CORNER_TEX + x]           = t;
+            s_corner_tex[y * UI_CORNER_TEX + e - x]       = t;
+            s_corner_tex[(e - y) * UI_CORNER_TEX + x]     = t;
+            s_corner_tex[(e - y) * UI_CORNER_TEX + e - x] = t;
         }
     }
+    sceKernelDcacheWritebackRange(s_corner_tex, sizeof s_corner_tex);
 }
 
 int pspsky_ui_init(void)
@@ -2219,13 +2241,9 @@ int pspsky_ui_init(void)
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
-    for (i = 0; i < UI_TL_TEX_SLOTS; i++) {
-        s_tl_tex_post[i] = -1;
-    }
     for (i = 0; i < UI_AV_SLOTS; i++) {
         s_av_key[i] = NULL;
     }
-    s_tl_tex_next  = 0;
     s_prev_buttons = 0;
     s_scroll       = 0;
     s_shell        = 0;
@@ -2507,18 +2525,18 @@ int pspsky_ui_preview_image(const pspsky_ui_preview_t *pv)
     SceCtrlData pad;
     int         first   = 1;
     int         has_img = 0;
-    int         potw    = UI_PREV_MIN_DIM;
-    int         poth    = UI_PREV_MIN_DIM;
+    int         potw    = UI_TEX_MIN_DIM;
+    int         poth    = UI_TEX_MIN_DIM;
 
     if (!s_inited || pv == NULL || pv->path == NULL) {
         return 0;
     }
 
     if (pv->rgb != NULL &&
-        pv->thumb_w >= 1 && pv->thumb_w <= UI_PREV_MAX_DIM &&
-        pv->thumb_h >= 1 && pv->thumb_h <= UI_PREV_MAX_DIM) {
-        potw    = ui_prev_pow2(pv->thumb_w);
-        poth    = ui_prev_pow2(pv->thumb_h);
+        pv->thumb_w >= 1 && pv->thumb_w <= UI_TEX_MAX_DIM &&
+        pv->thumb_h >= 1 && pv->thumb_h <= UI_TEX_MAX_DIM) {
+        potw    = ui_tex_pow2(pv->thumb_w);
+        poth    = ui_tex_pow2(pv->thumb_h);
         has_img = 1;
         ui_prev_upload(pv, potw, poth);
     }
@@ -2547,14 +2565,69 @@ int pspsky_ui_preview_image(const pspsky_ui_preview_t *pv)
     }
 }
 
+void pspsky_ui_tl_image_max(int count, int *max_w, int *max_h)
+{
+    *max_w = (count > 1) ? PSPSKY_UI_TL_GRID_COL_W : PSPSKY_UI_TL_IMG_MAX_W;
+    *max_h = (count > 2) ? PSPSKY_UI_TL_GRID_ROW_H : PSPSKY_UI_TL_IMG_MAX_H;
+}
+
+size_t pspsky_ui_tl_image_bytes(int w, int h)
+{
+    return (size_t)ui_tl_stride(w) * (size_t)h * sizeof(unsigned short);
+}
+
+/* The GE samples the result in place, so thumbnails need no upload slots. */
+int pspsky_ui_tl_image_make(pspsky_ui_tl_image_t *out,
+                            const unsigned char *rgb, int w, int h)
+{
+    unsigned short *tex;
+    size_t          bytes;
+    int             stride, x, y;
+
+    if (out == NULL || rgb == NULL ||
+        w < 1 || w > PSPSKY_UI_TL_IMG_MAX_W ||
+        h < 1 || h > PSPSKY_UI_TL_IMG_MAX_H) {
+        return PSPSKY_E_ARG;
+    }
+    stride = ui_tl_stride(w);
+    bytes  = pspsky_ui_tl_image_bytes(w, h);
+    /* The GE requires 16-byte aligned texture addresses. */
+    tex = (unsigned short *)memalign(16, bytes);
+    if (tex == NULL) {
+        return PSPSKY_E_NOMEM;
+    }
+    for (y = 0; y < h; y++) {
+        const unsigned char *src = rgb + (size_t)y * (size_t)w * 3u;
+        const unsigned char *d   = k_ui_dither[y & 3];
+        unsigned short      *dst = tex + (size_t)y * (size_t)stride;
+
+        for (x = 0; x < w; x++) {
+            /* Offsets cover one quantization step, preserving the mean. */
+            unsigned int t = d[x & 3];
+            unsigned int r = src[x * 3 + 0] + (t >> 1);
+            unsigned int g = src[x * 3 + 1] + (t >> 2);
+            unsigned int b = src[x * 3 + 2] + (t >> 1);
+
+            r = (r > 255u) ? 255u : r;
+            g = (g > 255u) ? 255u : g;
+            b = (b > 255u) ? 255u : b;
+            /* GU_PSM_5650 stores red in the low bits. */
+            dst[x] = (unsigned short)(((b >> 3) << 11) | ((g >> 2) << 5) |
+                                      (r >> 3));
+        }
+    }
+    sceKernelDcacheWritebackRange(tex, (unsigned int)bytes);
+    out->tex = tex;
+    out->w   = (short)w;
+    out->h   = (short)h;
+    return PSPSKY_OK;
+}
+
 void pspsky_ui_timeline_invalidate(int reset_scroll)
 {
     int i;
 
     s_layout_valid = 0;
-    for (i = 0; i < UI_TL_TEX_SLOTS; i++) {
-        s_tl_tex_post[i] = -1;
-    }
     for (i = 0; i < UI_AV_SLOTS; i++) {
         s_av_key[i] = NULL;
     }

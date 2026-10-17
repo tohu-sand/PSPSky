@@ -39,7 +39,7 @@ PSP_HEAP_SIZE_KB(-2048);
 #define APP_NET_TIMEOUT_SEC 45
 
 /* Thumbnails beyond this heap budget remain placeholders. */
-#define APP_IMG_CACHE_MAX   (4 * 1024 * 1024)
+#define APP_IMG_CACHE_MAX   (5 * 1024 * 1024)
 
 /* Avatars survive timeline refreshes and are shared by author URL. */
 #define APP_AVATAR_MAX      128
@@ -63,7 +63,7 @@ static int                g_post_count;
 static char               g_cursor[PSPSKY_MAX_CURSOR];
 static int                g_has_more;
 
-/* Owns thumbnail RGB buffers; the UI borrows them. */
+/* Owns thumbnail textures; the UI borrows them. */
 static pspsky_ui_tl_image_t g_tl_images[APP_MAX_POSTS][PSPSKY_MAX_IMAGES];
 static size_t               g_img_cache_bytes;
 /* Shared decode scratch for thumbnails and avatars. */
@@ -366,7 +366,7 @@ static void img_cache_clear(void)
     pspsky_ui_timeline_invalidate(0);
     for (i = 0; i < APP_MAX_POSTS; i++) {
         for (j = 0; j < PSPSKY_MAX_IMAGES; j++) {
-            free((void *)g_tl_images[i][j].rgb);
+            free((void *)g_tl_images[i][j].tex);
         }
     }
     memset(g_tl_images, 0, sizeof(g_tl_images));
@@ -552,12 +552,11 @@ static void fetch_new_images(int start)
     }
 
     for (i = start; i < g_post_count; i++) {
-        int max_w = (g_posts[i].img_count > 1) ? PSPSKY_UI_TL_GRID_COL_W
-                                                : PSPSKY_UI_TL_IMG_MAX_W;
+        int max_w, max_h;
 
+        pspsky_ui_tl_image_max(g_posts[i].img_count, &max_w, &max_h);
         for (j = 0; j < g_posts[i].img_count && j < PSPSKY_MAX_IMAGES; j++) {
             unsigned char *body = NULL;
-            unsigned char *rgb;
             size_t         len  = 0;
             size_t         sz;
             int            tw   = 0;
@@ -583,8 +582,7 @@ static void fetch_new_images(int start)
             if (pspsky_atp_fetch_image(&g_transport,
                                        g_posts[i].images[j].thumb_url,
                                        &body, &len, NULL) == PSPSKY_OK &&
-                pspsky_webp_thumb_decode(body, len, max_w,
-                                         PSPSKY_UI_TL_IMG_MAX_H,
+                pspsky_webp_thumb_decode(body, len, max_w, max_h,
                                          g_img_work, sizeof(g_img_work),
                                          &tw, &th, &sw, &sh) == PSPSKY_OK) {
                 decoded = 1;
@@ -595,18 +593,12 @@ static void fetch_new_images(int start)
                 continue;
             }
 
-            sz = (size_t)tw * (size_t)th * 3u;
-            if (g_img_cache_bytes + sz > (size_t)APP_IMG_CACHE_MAX) {
+            sz = pspsky_ui_tl_image_bytes(tw, th);
+            if (g_img_cache_bytes + sz > (size_t)APP_IMG_CACHE_MAX ||
+                pspsky_ui_tl_image_make(&g_tl_images[i][j], g_img_work,
+                                        tw, th) != PSPSKY_OK) {
                 continue;
             }
-            rgb = (unsigned char *)malloc(sz);
-            if (rgb == NULL) {
-                continue;
-            }
-            memcpy(rgb, g_img_work, sz);
-            g_tl_images[i][j].rgb = rgb;
-            g_tl_images[i][j].w   = (short)tw;
-            g_tl_images[i][j].h   = (short)th;
             g_img_cache_bytes += sz;
         }
     }
