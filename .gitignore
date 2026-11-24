@@ -20,3 +20,6 @@ pspsky.cfg
 *:Zone.Identifier
 docs/INSTALL.md
 assets/*.svg
+
+# Binary distribution packages
+dist/

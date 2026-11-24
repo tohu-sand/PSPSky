@@ -24,10 +24,12 @@ MODE=""
 if command -v curl >/dev/null 2>&1 &&
    curl -fsSL --retry 3 --connect-timeout 20 -o "$BUNDLE" "$SRC_URL"; then
     MODE="upstream"
+    SOURCE="$SRC_URL"
     echo "source: $SRC_URL"
 elif [ -r "$SYSTEM_BUNDLE" ]; then
     cp "$SYSTEM_BUNDLE" "$BUNDLE"
     MODE="system"
+    SOURCE="$SYSTEM_BUNDLE"
     echo "source: $SYSTEM_BUNDLE (fallback: upstream fetch failed)"
 else
     echo "error: could not fetch $SRC_URL and $SYSTEM_BUNDLE is not readable" >&2
@@ -83,6 +85,12 @@ TMP_OUT="$WORK/cacert.pem"
     echo "#"
     echo "# Roots required to verify https://bsky.social from the PSP."
     echo "# Deploy alongside EBOOT.PBP as ms0:/PSP/GAME/PSPSKY/cacert.pem"
+    echo "#"
+    # This file is copied to the PSP on its own, so it carries its MPL notice.
+    echo "# Certificates from the Mozilla CA certificate store, via $SOURCE."
+    echo "# This Source Code Form is subject to the terms of the Mozilla Public"
+    echo "# License, v. 2.0. If a copy of the MPL was not distributed with this"
+    echo "# file, You can obtain one at https://mozilla.org/MPL/2.0/."
     echo ""
 } > "$TMP_OUT"
 

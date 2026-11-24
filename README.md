@@ -123,6 +123,16 @@ sh tools/make_cacert.sh
 
 更新したファイルを PSP の `EBOOT.PBP` と同じフォルダへコピーしてください。
 
+### バイナリ配布用のパッケージ
+
+リリースのタグをチェックアウトし、`make clean && make` でビルドしてから次のコマンドを実行します。
+
+```sh
+sh tools/make_dist.sh
+```
+
+`dist/` に 2 つのファイルが作成されます。1 つは `PSP/GAME/PSPSKY/` 以下の `EBOOT.PBP` と `cacert.pem`、ライセンス文書、README をまとめた zip です。もう 1 つは pthread-embedded のソースアーカイブです。pthread-embedded は LGPL で静的リンクされるため、そのソースもバイナリと同じ場所で提供する必要があります。GitHub の Releases で配布する場合は、そのタグのリリースに両方を添付してください。
+
 ## トラブルシューティング
 
 TLS エラーには `(curl:数字)` の形式でエラーコードが表示されます。
@@ -143,3 +153,7 @@ TLS エラーには `(curl:数字)` の形式でエラーコードが表示さ�
 ## ライセンス
 
 [MIT License](LICENSE)。第三者ソフトウェアと同梱素材のライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) を参照してください。
+
+`EBOOT.PBP` には pspdev SDK のライブラリが静的リンクされます。ビルドした `EBOOT.PBP` を配布する場合は、`LICENSE`、`THIRD_PARTY_LICENSES.md`、`licenses/` を同梱してください。
+
+PSPSky は Bluesky Social PBC と提携・承認関係のない非公式クライアントです。Bluesky は Bluesky Social PBC の商標です。

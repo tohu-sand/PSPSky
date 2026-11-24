@@ -4,12 +4,15 @@ This file lists third-party software used by this repository (bundled in the
 source tree or linked at build time from the pspdev SDK) and provides their
 license texts and required notices.
 
+Everything listed as linked from the pspdev SDK is statically linked into
+`EBOOT.PBP`. Anyone distributing a built `EBOOT.PBP` must include `LICENSE`,
+this file and the `licenses/` directory with it.
+
 ## Packages By License
 
 ### MIT
 
 - cJSON@1.7.18 (bundled, `vendor/cjson/`) — Copyright (c) 2009-2017 Dave Gamble and cJSON contributors
-- Bluesky Social app (https://github.com/bluesky-social/social-app) — the vector paths of the butterfly logo, the default avatar and the repost and reply icons, rasterized into `src/psp/ui_atlas.h` by `tools/gen_ui_atlas.py` — Copyright 2023–2026 Bluesky Social PBC
 
 ### curl
 
@@ -22,6 +25,7 @@ license texts and required notices.
 ### BSD-3-Clause
 
 - libwebp@1.5.0 (bundled, `vendor/libwebp/`, https://chromium.googlesource.com/webm/libwebp) — Copyright (c) 2010, Google Inc. All rights reserved. Only the decoder sources are bundled. As part of the WebM Project it also carries an additional intellectual property rights grant (patents); see `vendor/libwebp/PATENTS` for its full text.
+- PSPSDK (linked from the pspdev SDK, https://github.com/pspdev/pspsdk) — the startup code, libcglue, libpthreadglue and the `libpsp*` libraries — Copyright (c) 2005 adresd, Marcus R. Brown, James Forshaw, John Kelley, Jesper Svennevid
 
 ### Zlib
 
@@ -29,7 +33,15 @@ license texts and required notices.
 
 ### CC-BY-SA-3.0
 
-- intraFont (linked from the pspdev SDK, https://github.com/pspdev/libintraFont) — no copyright holder is named in the upstream LICENSE file
+- intraFont 0.31 (linked from the pspdev SDK, https://github.com/pspdev/libintraFont) — by BenHur (http://www.psp-programming.com/benhur); uses parts of pgeFont by InsertWittyName (http://insomniac.0x89.org); G-spec code by Geecko
+
+### LGPL-2.0-or-later
+
+- pthread-embedded (linked from the pspdev SDK, https://github.com/pspdev/pthread-embedded) — Copyright (C) 2008 Jason Schmidlapp; based upon Pthreads-win32, Copyright (C) 1998 John E. Bossom and Copyright (C) 1999, 2005 Pthreads-win32 contributors
+
+### Newlib
+
+- newlib (libc and libm, linked from the pspdev SDK, https://github.com/pspdev/newlib) — Copyright (c) 1994-2009 Red Hat, Inc., The Regents of the University of California, and the other contributors named in `licenses/COPYING.NEWLIB`
 
 ### MPL-2.0
 
@@ -298,6 +310,39 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
+### BSD-3-Clause (PSPSDK)
+
+```text
+Copyright (c) 2005  adresd
+Copyright (c) 2005  Marcus R. Brown
+Copyright (c) 2005  James Forshaw
+Copyright (c) 2005  John Kelley
+Copyright (c) 2005  Jesper Svennevid
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. The names of the authors may not be used to endorse or promote products
+   derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHORS ``AS IS'' AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
 ### Zlib
 
 ```text
@@ -332,10 +377,38 @@ http://creativecommons.org/licenses/by-sa/3.0/ or send a letter to Creative
 Commons, 171 Second Street, Suite 300, San Francisco, California, 94105, USA.
 ```
 
-intraFont is not included in this repository; it is linked at build time from
-the pspdev SDK. Note that binaries built from this repository statically link
-intraFont, so distributing prebuilt binaries may carry CC BY-SA share-alike
-obligations.
+The upstream sources (`intraFont.h`) credit the authors as follows:
+
+```text
+intraFont Version 0.31 by BenHur - http://www.psp-programming.com/benhur
+
+Uses parts of pgeFont by InsertWittyName - http://insomniac.0x89.org
+G-spec code by Geecko
+```
+
+intraFont is not included in this repository. Binaries built from it
+statically link the unmodified library from the pspdev SDK, and intraFont
+itself remains under CC BY-SA 3.0. If such a binary is an Adaptation of
+intraFont under CC BY-SA 3.0, it must be distributed under the same license.
+The MIT License of PSPSky's own code permits that, and the source code in this
+repository remains under the MIT License.
+
+### LGPL-2.0-or-later
+
+pthread-embedded is licensed under the GNU Lesser General Public License,
+version 2 or (at your option) any later version. The text of version 2.1 is in
+`licenses/LGPL-2.1.txt`, and the source code is available from
+https://github.com/pspdev/pthread-embedded.
+
+`EBOOT.PBP` links pthread-embedded statically. To use a modified
+pthread-embedded, install it in the pspdev SDK and rebuild `EBOOT.PBP` from
+the source code in this repository as described in `README.md`.
+
+### Newlib
+
+newlib is a collection of software from several sources under BSD-style and
+similar licenses. Its notices are reproduced in full in
+`licenses/COPYING.NEWLIB`, as installed by the pspdev SDK.
 
 ### MPL-2.0
 
