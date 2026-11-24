@@ -4,14 +4,13 @@
 Masks are supersampled and box-filtered. Repeated edge texels prevent
 bilinear filtering from sampling adjacent icons.
 
-Logo, avatar, repost and reply paths: bluesky-social/social-app (MIT License,
-Copyright 2023-2026 Bluesky Social PBC). See THIRD_PARTY_LICENSES.md.
+Every shape is drawn here from primitives; the atlas contains no third-party
+artwork. ICON0.PNG and PIC1.PNG use the same mark_mask() geometry.
 
 Usage: python3 tools/gen_ui_atlas.py > src/psp/ui_atlas.h
 """
 
 import math
-import re
 import sys
 
 from PIL import Image, ImageChops, ImageDraw
@@ -19,234 +18,29 @@ from PIL import Image, ImageChops, ImageDraw
 SS = 16  # supersampling factor
 ATLAS_W = 128  # Height is rounded up to a power of two.
 
-# src/view/icons/Logo.tsx, viewBox 0 0 64 57
-LOGO_PATH = (
-    "M13.873 3.805C21.21 9.332 29.103 20.537 32 26.55v15.882c0-.338-.13.044"
-    "-.41.867-1.512 4.456-7.418 21.847-20.923 7.944-7.111-7.32-3.819-14.64 "
-    "9.125-16.85-7.405 1.264-15.73-.825-18.014-9.015C1.12 23.022 0 8.51 0 "
-    "6.55 0-3.268 8.579-.182 13.873 3.805ZM50.127 3.805C42.79 9.332 34.897 "
-    "20.537 32 26.55v15.882c0-.338.13.044.41.867 1.512 4.456 7.418 21.847 "
-    "20.923 7.944 7.111-7.32 3.819-14.64-9.125-16.85 7.405 1.264 15.73-.825 "
-    "18.014-9.015C62.88 23.022 64 8.51 64 6.55c0-9.818-8.578-6.732-13.873"
-    "-2.745Z")
-
-# src/view/com/util/UserAvatar.tsx DefaultAvatar, viewBox 0 0 24 24.
-# Head: circle at (12, 9.5), r = 3.5. This path defines the shoulders.
-AVATAR_BODY_PATH = (
-    "M 12.058 22.784 C 9.422 22.784 7.007 21.836 5.137 20.262 C 5.667 17.988 "
-    "8.534 16.25 11.99 16.25 C 15.494 16.25 18.391 18.036 18.864 20.357 C "
-    "17.01 21.874 14.64 22.784 12.058 22.784 Z")
-
-# src/components/icons/Repost.tsx Repost_Stroke2_Corner3_Rounded,
-# viewBox 0 0 24 24
-REPOST_PATH = (
-    "M16.793 2.293a1 1 0 0 1 1.414 0L20.5 4.586a2 2 0 0 1 0 2.828l-2.293 "
-    "2.293a1 1 0 0 1-1.414-1.414L18.086 7H7a2 2 0 0 0-2 2v2a1 1 0 1 1-2 0V9a4 "
-    "4 0 0 1 4-4h11.086l-1.293-1.293a1 1 0 0 1 0-1.414ZM20 12a1 1 0 0 1 1 "
-    "1v2a4 4 0 0 1-4 4H5.914l1.293 1.293a1 1 0 1 1-1.414 1.414L3.5 19.414a2 2 "
-    "0 0 1 0-2.828l2.293-2.293a1 1 0 0 1 1.414 1.414L5.914 17H17a2 2 0 0 0 "
-    "2-2v-2a1 1 0 0 1 1-1Z")
-
-# src/components/icons/Arrow.tsx ArrowCornerDownRight_Stroke2_Corner2_Rounded,
-# viewBox 0 0 24 24
-REPLY_PATH = (
-    "M15.793 10.293a1 1 0 0 1 1.338-.068l.076.068 3.293 3.293a2 2 0 0 1 "
-    ".138 2.677l-.138.151-3.293 3.293a1 1 0 1 1-1.414-1.414L18.086 16H8a5 5 "
-    "0 0 1-5-5V5a1 1 0 0 1 2 0v6a3 3 0 0 0 3 3h10.086l-2.293-2.293-.068-.076"
-    "a1 1 0 0 1 .068-1.338Z")
-
-_NUM = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
-
-
-class _Reader:
-    def __init__(self, d):
-        self.d = d
-        self.i = 0
-
-    def _skip(self):
-        while self.i < len(self.d) and self.d[self.i] in " ,\t\r\n":
-            self.i += 1
-
-    def at_number(self):
-        self._skip()
-        return self.i < len(self.d) and (self.d[self.i] in "+-." or
-                                         self.d[self.i].isdigit())
-
-    def command(self):
-        self._skip()
-        if self.i >= len(self.d):
-            return None
-        c = self.d[self.i]
-        self.i += 1
-        return c
-
-    def number(self):
-        self._skip()
-        m = _NUM.match(self.d, self.i)
-        if not m:
-            raise ValueError("number expected at %d" % self.i)
-        self.i = m.end()
-        return float(m.group(0))
-
-    def flag(self):
-        # Arc flags are single digits and may be written without separators.
-        self._skip()
-        c = self.d[self.i]
-        self.i += 1
-        return c == "1"
-
-
-def _bezier(p0, p1, p2, p3, n=24):
-    out = []
-    for k in range(1, n + 1):
-        t = k / n
-        u = 1 - t
-        out.append((u * u * u * p0[0] + 3 * u * u * t * p1[0] +
-                    3 * u * t * t * p2[0] + t * t * t * p3[0],
-                    u * u * u * p0[1] + 3 * u * u * t * p1[1] +
-                    3 * u * t * t * p2[1] + t * t * t * p3[1]))
-    return out
-
-
-def _arc(p0, rx, ry, phi_deg, large, sweep, p1):
-    """SVG arc, endpoint form converted per SVG 1.1 appendix F.6.5."""
-    if rx == 0 or ry == 0 or p0 == p1:
-        return [p1]
-    rx, ry = abs(rx), abs(ry)
-    phi = math.radians(phi_deg)
-    cp, sp = math.cos(phi), math.sin(phi)
-    dx, dy = (p0[0] - p1[0]) / 2, (p0[1] - p1[1]) / 2
-    x1 = cp * dx + sp * dy
-    y1 = -sp * dx + cp * dy
-    lam = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry)
-    if lam > 1:
-        rx *= math.sqrt(lam)
-        ry *= math.sqrt(lam)
-    num = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1
-    den = rx * rx * y1 * y1 + ry * ry * x1 * x1
-    co = math.sqrt(max(0.0, num / den)) if den else 0.0
-    if large == sweep:
-        co = -co
-    cx1 = co * rx * y1 / ry
-    cy1 = -co * ry * x1 / rx
-    cx = cp * cx1 - sp * cy1 + (p0[0] + p1[0]) / 2
-    cy = sp * cx1 + cp * cy1 + (p0[1] + p1[1]) / 2
-
-    def ang(ux, uy, vx, vy):
-        a = math.atan2(ux * vy - uy * vx, ux * vx + uy * vy)
-        return a
-
-    t1 = ang(1, 0, (x1 - cx1) / rx, (y1 - cy1) / ry)
-    dt = ang((x1 - cx1) / rx, (y1 - cy1) / ry,
-             (-x1 - cx1) / rx, (-y1 - cy1) / ry)
-    if not sweep and dt > 0:
-        dt -= 2 * math.pi
-    elif sweep and dt < 0:
-        dt += 2 * math.pi
-    n = max(4, int(abs(dt) / (math.pi / 32)) + 1)
-    out = []
-    for k in range(1, n + 1):
-        t = t1 + dt * k / n
-        x = rx * math.cos(t)
-        y = ry * math.sin(t)
-        out.append((cp * x - sp * y + cx, sp * x + cp * y + cy))
-    return out
-
-
-def flatten(d):
-    """Returns the subpaths of SVG path data d as lists of points."""
-    r = _Reader(d)
-    subs = []
-    cur = []
-    pos = (0.0, 0.0)
-    start = pos
-    last_ctrl = None
-    cmd = None
-    while True:
-        if r.at_number() and cmd is not None:
-            c = cmd
-            if c in "Mm":  # implicit lineto after moveto
-                c = "L" if c == "M" else "l"
-        else:
-            c = r.command()
-            if c is None:
-                break
-        rel = c.islower()
-        C = c.upper()
-        ox, oy = pos if rel else (0.0, 0.0)
-        ctrl = None
-        if C == "M":
-            if cur:
-                subs.append(cur)
-            pos = (ox + r.number(), oy + r.number())
-            start = pos
-            cur = [pos]
-        elif C == "L":
-            pos = (ox + r.number(), oy + r.number())
-            cur.append(pos)
-        elif C == "H":
-            pos = ((ox if rel else 0.0) + r.number(), pos[1])
-            cur.append(pos)
-        elif C == "V":
-            pos = (pos[0], (oy if rel else 0.0) + r.number())
-            cur.append(pos)
-        elif C == "C":
-            p1 = (ox + r.number(), oy + r.number())
-            p2 = (ox + r.number(), oy + r.number())
-            p3 = (ox + r.number(), oy + r.number())
-            cur.extend(_bezier(pos, p1, p2, p3))
-            ctrl, pos = p2, p3
-        elif C == "S":
-            p1 = pos if last_ctrl is None else (2 * pos[0] - last_ctrl[0],
-                                                 2 * pos[1] - last_ctrl[1])
-            p2 = (ox + r.number(), oy + r.number())
-            p3 = (ox + r.number(), oy + r.number())
-            cur.extend(_bezier(pos, p1, p2, p3))
-            ctrl, pos = p2, p3
-        elif C == "Q":
-            q = (ox + r.number(), oy + r.number())
-            p3 = (ox + r.number(), oy + r.number())
-            p1 = (pos[0] + 2 / 3 * (q[0] - pos[0]), pos[1] + 2 / 3 * (q[1] - pos[1]))
-            p2 = (p3[0] + 2 / 3 * (q[0] - p3[0]), p3[1] + 2 / 3 * (q[1] - p3[1]))
-            cur.extend(_bezier(pos, p1, p2, p3))
-            pos = p3
-        elif C == "A":
-            rx, ry, phi = r.number(), r.number(), r.number()
-            large, sweep = r.flag(), r.flag()
-            p3 = (ox + r.number(), oy + r.number())
-            cur.extend(_arc(pos, rx, ry, phi, large, sweep, p3))
-            pos = p3
-        elif C == "Z":
-            pos = start
-            if cur:
-                subs.append(cur)
-            cur = []
-        else:
-            raise ValueError("unsupported path command " + c)
-        last_ctrl = ctrl
-        cmd = c
-    if cur:
-        subs.append(cur)
-    return subs
+# Cloud speech bubble in a 64-unit-wide box.
+MARK_W, MARK_H = 64, 51
 
 
 def canvas(w, h):
     return Image.new("L", (w * SS, h * SS), 0)
 
 
-def fill_path(img, d, scale, dx=0.0, dy=0.0):
-    """Subpath union matches nonzero filling for these icons."""
-    draw = ImageDraw.Draw(img)
-    for sub in flatten(d):
-        pts = [((x * scale + dx) * SS, (y * scale + dy) * SS) for x, y in sub]
-        if len(pts) >= 3:
-            draw.polygon(pts, fill=255)
-
-
 def fill_circle(img, cx, cy, r):
     ImageDraw.Draw(img).ellipse(
         [(cx - r) * SS, (cy - r) * SS, (cx + r) * SS - 1, (cy + r) * SS - 1],
         fill=255)
+
+
+def fill_ellipse(img, cx, cy, rx, ry):
+    ImageDraw.Draw(img).ellipse(
+        [(cx - rx) * SS, (cy - ry) * SS, (cx + rx) * SS - 1, (cy + ry) * SS - 1],
+        fill=255)
+
+
+def fill_rrect(img, x0, y0, x1, y1, r):
+    ImageDraw.Draw(img).rounded_rectangle(
+        [x0 * SS, y0 * SS, x1 * SS - 1, y1 * SS - 1], radius=r * SS, fill=255)
 
 
 def fill_poly(img, pts):
@@ -259,6 +53,21 @@ def thick_line(img, x0, y0, x1, y1, w):
     nx, ny = nx * k, ny * k
     fill_poly(img, [(x0 + nx, y0 + ny), (x1 + nx, y1 + ny),
                     (x1 - nx, y1 - ny), (x0 - nx, y0 - ny)])
+
+
+def stroke(img, pts, w):
+    """Polyline with round caps and joins."""
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        thick_line(img, x0, y0, x1, y1, w)
+    for x, y in pts:
+        fill_circle(img, x, y, w / 2)
+
+
+def arc(cx, cy, r, a0, a1, n=12):
+    """Points from angle a0 to a1 in degrees; y points down."""
+    return [(cx + r * math.cos(math.radians(a0 + (a1 - a0) * k / n)),
+             cy + r * math.sin(math.radians(a0 + (a1 - a0) * k / n)))
+            for k in range(n + 1)]
 
 
 def finish(img):
@@ -278,21 +87,49 @@ def inverse(img):
 def default_avatar(d):
     s = d / 24.0
     img = canvas(d, d)
-    fill_circle(img, 12 * s, 9.5 * s, 3.5 * s)
-    fill_path(img, AVATAR_BODY_PATH, s)
+    fill_circle(img, 12 * s, 9 * s, 4 * s)
+    fill_ellipse(img, 12 * s, 22.5 * s, 8 * s, 7 * s)
     return ImageChops.multiply(finish(img), circle(d))
 
 
-def logo(w):
-    h = int(math.ceil(57 * w / 64))
-    img = canvas(w, h)
-    fill_path(img, LOGO_PATH, w / 64)
+def mark_mask(w):
+    """Returns the mark w texels wide, still supersampled by SS."""
+    s = w / MARK_W
+    img = Image.new("L", (int(round(w * SS)),
+                          int(math.ceil(MARK_H * s)) * SS), 0)
+    fill_rrect(img, 3 * s, 18 * s, 61 * s, 42 * s, 12 * s)
+    fill_circle(img, 20 * s, 22 * s, 11 * s)
+    fill_circle(img, 36 * s, 15 * s, 15 * s)
+    fill_circle(img, 50 * s, 25 * s, 11 * s)
+    fill_poly(img, [(11 * s, 35 * s), (29 * s, 40 * s), (5 * s, 51 * s)])
+    return img
+
+
+def mark(w):
+    return finish(mark_mask(w))
+
+
+# Repost and reply are drawn on a 24-unit grid at 12 texels. Stroke centres
+# sit on odd units so that the 1-texel strokes land on texel centres; solid
+# arrowheads stay legible at that size where open chevrons do not.
+def repost(n):
+    s = n / 24.0
+    img = canvas(n, n)
+    top = [(5, 13)] + arc(8, 10, 3, 180, 270) + [(16, 7)]
+    bot = [(19, 11)] + arc(16, 14, 3, 0, 90) + [(8, 17)]
+    for pts in (top, bot):
+        stroke(img, [(x * s, y * s) for x, y in pts], 2 * s)
+    fill_poly(img, [(15 * s, 3 * s), (21 * s, 7 * s), (15 * s, 11 * s)])
+    fill_poly(img, [(9 * s, 13 * s), (3 * s, 17 * s), (9 * s, 21 * s)])
     return finish(img)
 
 
-def icon24(path, size):
-    img = canvas(size, size)
-    fill_path(img, path, size / 24)
+def reply(n):
+    s = n / 24.0
+    img = canvas(n, n)
+    line = [(5, 4)] + arc(9, 11, 4, 180, 90) + [(16, 15)]
+    stroke(img, [(x * s, y * s) for x, y in line], 2 * s)
+    fill_poly(img, [(15 * s, 11 * s), (21 * s, 15 * s), (15 * s, 19 * s)])
     return finish(img)
 
 
@@ -364,12 +201,12 @@ ICONS = [
     ("CIRCLE32",  circle(32)),
     ("ICIRCLE32", inverse(circle(32))),
     ("AVATAR32",  default_avatar(32)),
-    ("LOGO48",    logo(48)),
-    ("LOGO20",    logo(20)),
+    ("LOGO48",    mark(48)),
+    ("LOGO20",    mark(20)),
     ("CIRCLE16",  circle(16)),
     ("ICIRCLE16", inverse(circle(16))),
-    ("REPOST",    icon24(REPOST_PATH, 12)),
-    ("REPLY",     icon24(REPLY_PATH, 12)),
+    ("REPOST",    repost(12)),
+    ("REPLY",     reply(12)),
     ("FOLDER",    folder(12)),
     ("PICTURE",   picture(12)),
     ("TRIANGLE",  glyph_triangle(10)),
@@ -421,13 +258,7 @@ def main():
             nib.append(lo | (hi << 4))
 
     out = sys.stdout
-    out.write("/*\n"
-              " * Generated by tools/gen_ui_atlas.py; do not edit by hand.\n"
-              " *\n"
-              " * The logo, default avatar, repost and reply paths come from\n"
-              " * bluesky-social/social-app (MIT License, Copyright 2023-2026\n"
-              " * Bluesky Social PBC); see THIRD_PARTY_LICENSES.md.\n"
-              " */\n")
+    out.write("/* Generated by tools/gen_ui_atlas.py; do not edit by hand. */\n")
     out.write("#ifndef PSPSKY_UI_ATLAS_H\n#define PSPSKY_UI_ATLAS_H\n\n")
     out.write("/* Only UI_ATLAS_ROWS rows of the power-of-two texture are stored. */\n")
     out.write("#define UI_ATLAS_W %d\n#define UI_ATLAS_H %d\n#define UI_ATLAS_ROWS %d\n\n"
